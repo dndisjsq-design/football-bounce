@@ -25,8 +25,9 @@ interface ScrollState {
 
 interface PlayerShopProfile {
   intro: string;
-  strongFoot: number;
-  weakFoot: number;
+  bodyType: string;
+  nationality: string;
+  club: string;
   height: number;
   weight: number;
   age: number;
@@ -374,8 +375,9 @@ export function showPlayerDetail(root: Node, player: RosterPlayer, options: Play
 
   const rows: Array<[string, string]> = [
     ['能力值', String(player.score)],
-    ['顺足脚评分', String(profile.strongFoot)],
-    ['逆足脚评分', String(profile.weakFoot)],
+    ['体型', profile.bodyType],
+    ['国籍', profile.nationality],
+    ['俱乐部', profile.club],
     ['身高体重', `${profile.height}cm / ${profile.weight}kg`],
     ['年龄', `${profile.age}岁`],
     ['技能介绍', profile.skills],
@@ -583,11 +585,15 @@ function getPlayerProfile(player: RosterPlayer): PlayerShopProfile {
   const temperament = ['我喜欢把节奏拉快，用第一脚弹射打开局面。', '我会先看角度，再用弧线把球送到最难防的位置。', '我不怕身体对抗，越混乱越能抢到第二落点。', '我擅长贴边走位，能把死角变成进攻路线。'][seed % 4];
   const skillA = ['强力弹射', '精准制导', '外弧修正', '撞墙加速', '稳定回防'][seed % 5];
   const skillB = ['禁区抢点', '长线推进', '角度封锁', '连续碰撞', '耐力压制'][(seed + 2) % 5];
+  const bodyType = ['灵巧型', '均衡型', '精瘦型', '强壮型', '高大型', '爆发型'][seed % 6];
+  const nationality = ['巴西', '阿根廷', '葡萄牙', '法国', '英格兰', '西班牙', '德国', '意大利', '荷兰', '日本'][(seed + score) % 10];
+  const club = ['绿茵闪电', '北城弹射', '海港飞翼', '山城火炮', '蓝湾竞技', '红塔联队', '银河冲锋', '星河守卫'][(seed * 3 + score) % 8];
   const rarityBoost = player.rarity === 'red' ? 8 : player.rarity === 'orange' ? 5 : player.rarity === 'purple' ? 2 : 0;
   return {
     intro: `${temperament}定位是${style}。`,
-    strongFoot: clamp(score + 2 + (seed % 4), 1, 100),
-    weakFoot: clamp(score - 8 + (seed % 5), 1, 100),
+    bodyType,
+    nationality,
+    club,
     height: 168 + ((seed * 7) % 27),
     weight: 62 + ((seed * 5) % 25),
     age: 18 + ((seed * 3) % 17),
