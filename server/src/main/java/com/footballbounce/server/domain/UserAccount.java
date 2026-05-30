@@ -14,6 +14,8 @@ public class UserAccount {
 
     private String avatarUrl;
 
+    private Integer coins;
+
     private LocalDateTime createdAt;
 
     private LocalDateTime updatedAt;
@@ -56,6 +58,14 @@ public class UserAccount {
 
     public void setAvatarUrl(String avatarUrl) {
         this.avatarUrl = avatarUrl;
+    }
+
+    public Integer getCoins() {
+        return coins;
+    }
+
+    public void setCoins(Integer coins) {
+        this.coins = coins;
     }
 
     public LocalDateTime getCreatedAt() {

@@ -30,12 +30,14 @@ public class UserService {
 
     private final UserMapper userMapper;
     private final UserLoginSessionMapper sessionMapper;
+    private final LineupService lineupService;
     private final PasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
     private final SecureRandom secureRandom = new SecureRandom();
 
-    public UserService(UserMapper userMapper, UserLoginSessionMapper sessionMapper) {
+    public UserService(UserMapper userMapper, UserLoginSessionMapper sessionMapper, LineupService lineupService) {
         this.userMapper = userMapper;
         this.sessionMapper = sessionMapper;
+        this.lineupService = lineupService;
     }
 
     @Transactional
@@ -90,7 +92,9 @@ public class UserService {
         user.setUsername(username);
         user.setPasswordHash(passwordEncoder.encode(request.getPassword()));
         user.setDisplayName(username);
+        user.setCoins(6000);
         userMapper.insert(user);
+        lineupService.initializeNewUserDefaults(user.getId());
         return AuthResponse.success("注册成功", UserDto.from(user));
     }
 

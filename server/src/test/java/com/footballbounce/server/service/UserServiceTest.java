@@ -3,6 +3,7 @@ package com.footballbounce.server.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.footballbounce.server.domain.UserAccount;
@@ -20,13 +21,15 @@ class UserServiceTest {
 
     private UserMapper userMapper;
     private UserLoginSessionMapper sessionMapper;
+    private LineupService lineupService;
     private UserService userService;
 
     @BeforeEach
     void setUp() {
         userMapper = mock(UserMapper.class);
         sessionMapper = mock(UserLoginSessionMapper.class);
-        userService = new UserService(userMapper, sessionMapper);
+        lineupService = mock(LineupService.class);
+        userService = new UserService(userMapper, sessionMapper, lineupService);
     }
 
     @Test
@@ -84,6 +87,8 @@ class UserServiceTest {
         assertThat(response.code()).isEqualTo(AuthCode.SUCCESS);
         assertThat(response.user()).isNotNull();
         assertThat(response.user().username()).isEqualTo("player");
+        assertThat(response.user().coins()).isEqualTo(6000);
+        verify(lineupService).initializeNewUserDefaults(1L);
     }
 
     private LoginRequest login(String username, String password) {
@@ -106,6 +111,7 @@ class UserServiceTest {
         user.setUsername(username);
         user.setDisplayName(username);
         user.setPasswordHash(new BCryptPasswordEncoder().encode(password));
+        user.setCoins(6000);
         return user;
     }
 }

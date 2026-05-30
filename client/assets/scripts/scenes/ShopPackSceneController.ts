@@ -1,5 +1,6 @@
 import { AudioClip, AudioSource, Color, EventTouch, Graphics, Label, Mask, MaskType, Node, Sprite, UIOpacity, UITransform, Vec3, director, resources, tween } from 'cc';
-import { PlayerRarity, RosterPlayer, getOwnedPlayers } from '../services/PlayerRosterService';
+import { PlayerRarity, RosterPlayer } from '../services/PlayerRosterService';
+import { fetchShopPlayers } from '../services/ShopCatalogApiService';
 import { getCurrentCoins } from '../services/WalletService';
 import { renderStandardPlayerCard } from '../ui/PlayerCardView';
 import { findNode, rgba } from '../utils/CocosNodeUtils';
@@ -32,6 +33,15 @@ interface GachaPack {
   players: RosterPlayer[];
 }
 
+type PackMeta = Omit<GachaPack, 'players'>;
+
+const PACK_DEFINITIONS: PackMeta[] = [
+  { id: 'blaze', name: '烈焰巨星包', subtitle: '爆发型前锋概率池', topColor: rgba(255, 83, 59), bottomColor: rgba(164, 30, 64) },
+  { id: 'galaxy', name: '星河控场包', subtitle: '中场组织与弧线手感', topColor: rgba(122, 91, 255), bottomColor: rgba(28, 87, 187) },
+  { id: 'bolt', name: '闪电突击包', subtitle: '高速推进与抢点', topColor: rgba(0, 207, 224), bottomColor: rgba(22, 94, 202) },
+  { id: 'wall', name: '钢铁防线包', subtitle: '身体与回防强度', topColor: rgba(255, 174, 49), bottomColor: rgba(203, 71, 42) },
+];
+
 interface ScrollState {
   offset: number;
   startY: number;
@@ -48,17 +58,16 @@ export function bindShopPackScene(root: Node): void {
 
 class ShopPackScene {
   private root: Node;
-  private packs: GachaPack[] = buildGachaPacks();
 
   constructor(root: Node) {
     this.root = root;
   }
 
   start(): void {
-    this.packs.forEach((pack, index) => this.bindPack(pack, index));
+    PACK_DEFINITIONS.forEach((pack, index) => this.bindPack(pack, index));
   }
 
-  private bindPack(pack: GachaPack, index: number): void {
+  private bindPack(pack: PackMeta, index: number): void {
     const card = findNode(this.root, `PackCard_${index}`);
     const cover = findNode(this.root, `PackCover_${index}`);
     if (!card || !cover) return;
@@ -75,12 +84,13 @@ class ShopPackScene {
     bindButton(findNode(this.root, `ButtonPackTen_${index}`), () => this.startDrawFlow(pack, 10));
   }
 
-  private showPackContents(pack: GachaPack): void {
+  private showPackContents(pack: PackMeta): void {
     const overlay = createOverlay(this.root, 'PackContentsOverlay', rgba(3, 8, 20, 184));
     const panel = createPanel(overlay, 'PackContentsPanel', 0, -4, 350, 716);
     createRuntimeLabel(panel, 'PackContentsTitle', pack.name, 0, 320, 28, 300, 40, rgba(255, 246, 130), true);
     createRuntimeLabel(panel, 'PackContentsSubtitle', `${pack.subtitle}  |  红5 橙5 紫10 蓝20`, 0, 290, 13, 310, 24, rgba(210, 228, 255), true);
     createRuntimeLabel(panel, 'PackContentsRate', '概率：红50%  橙10%  紫20%  蓝20%', 0, 262, 12, 310, 22, rgba(255, 221, 92), true);
+    const status = createRuntimeLabel(panel, 'PackContentsStatus', '加载球员池...', 0, 30, 15, 260, 28, rgba(255, 232, 146), true);
 
     const viewport = createNode(panel, 'PackContentsViewport', 0, 30, 320, 430);
     const g = viewport.addComponent(Graphics);
@@ -89,17 +99,30 @@ class ShopPackScene {
     g.fill();
     const mask = viewport.addComponent(Mask);
     mask.type = MaskType.GRAPHICS_RECT;
-    new PlayerGrid(this.root, viewport, pack.players, 5, 58, 74).start();
+    void this.buildFreshPack(pack).then((freshPack) => {
+      status.destroy();
+      new PlayerGrid(this.root, viewport, freshPack.players, 5, 58, 74).start();
+    }).catch((error: Error) => {
+      const label = status.getComponent(Label);
+      if (label) label.string = error.message || '球员池加载失败';
+    });
 
     createRuntimeButton(panel, 'PackContentsSingle', '单抽100', -82, -288, 126, 42, rgba(255, 128, 31), () => this.startDrawFlow(pack, 1));
     createRuntimeButton(panel, 'PackContentsTen', '十连抽1000', 82, -288, 126, 42, rgba(180, 72, 232), () => this.startDrawFlow(pack, 10));
     createRuntimeButton(panel, 'PackContentsClose', '关闭', 0, -336, 126, 36, rgba(84, 102, 132), () => overlay.destroy());
   }
 
-  private startDrawFlow(pack: GachaPack, count: number): void {
-    const results = Array.from({ length: count }, () => drawFromPack(pack));
-    findNode(this.root, 'PackContentsOverlay')?.destroy();
-    this.showDrawAnimation(pack, results);
+  private startDrawFlow(pack: PackMeta, count: number): void {
+    this.setLoadingState('请求抽球...');
+    void this.buildFreshPack(pack).then((freshPack) => {
+      this.setLoadingState('');
+      if (freshPack.players.length === 0) return;
+      const results = Array.from({ length: count }, () => drawFromPack(freshPack));
+      findNode(this.root, 'PackContentsOverlay')?.destroy();
+      this.showDrawAnimation(freshPack, results);
+    }).catch((error: Error) => {
+      this.setLoadingState(error.message || '抽球请求失败');
+    });
   }
 
   private showDrawAnimation(pack: GachaPack, results: RosterPlayer[]): void {
@@ -128,6 +151,14 @@ class ShopPackScene {
     });
 
     createRuntimeButton(panel, 'GachaResultClose', '确认', 0, -panelHeight / 2 + 48, 126, 42, rgba(255, 128, 31), () => overlay.destroy());
+  }
+
+  private setLoadingState(message: string): void {
+    setLabelText(this.root, 'TextShopCoins', message || `金币 ${getCurrentCoins()}`);
+  }
+
+  private buildFreshPack(pack: PackMeta): Promise<GachaPack> {
+    return fetchShopPlayers().then((players) => buildGachaPack(players, pack, PACK_DEFINITIONS.findIndex((item) => item.id === pack.id)));
   }
 }
 
@@ -199,31 +230,21 @@ function bindBack(root: Node): void {
   bindButton(button, () => director.loadScene('Shop'));
 }
 
-function buildGachaPacks(): GachaPack[] {
-  const players = getOwnedPlayers();
+function buildGachaPack(players: RosterPlayer[], pack: PackMeta, packIndex: number): GachaPack {
   const red = byRarity(players, 'red');
   const orange = byRarity(players, 'orange');
   const purple = byRarity(players, 'purple');
   const blue = byRarity(players, 'blue');
-  const names = [
-    ['blaze', '烈焰巨星包', '爆发型前锋概率池', rgba(255, 83, 59), rgba(164, 30, 64)],
-    ['galaxy', '星河控场包', '中场组织与弧线手感', rgba(122, 91, 255), rgba(28, 87, 187)],
-    ['bolt', '闪电突击包', '高速推进与抢点', rgba(0, 207, 224), rgba(22, 94, 202)],
-    ['wall', '钢铁防线包', '身体与回防强度', rgba(255, 174, 49), rgba(203, 71, 42)],
-  ] as const;
-  return names.map(([id, name, subtitle, topColor, bottomColor], index) => ({
-    id,
-    name,
-    subtitle,
-    topColor,
-    bottomColor,
+  const index = Math.max(0, packIndex);
+  return {
+    ...pack,
     players: [
       ...topDistributedGroup(red, index),
       ...topDistributedGroup(orange, index),
       ...cyclicSlice(purple, index * 5, 10),
       ...cyclicSlice(blue, 0, 20),
     ],
-  }));
+  };
 }
 
 function byRarity(players: RosterPlayer[], rarity: PlayerRarity): RosterPlayer[] {
@@ -934,7 +955,7 @@ function ballColor(rarity: PlayerRarity): Color {
   return rgba(55, 143, 238);
 }
 
-function drawPackCard(card: Node, pack: GachaPack): void {
+function drawPackCard(card: Node, pack: PackMeta): void {
   const g = card.getComponent(Graphics) || card.addComponent(Graphics);
   g.clear();
   g.fillColor = pack.bottomColor;
@@ -952,7 +973,7 @@ function drawPackCard(card: Node, pack: GachaPack): void {
   g.fill();
 }
 
-function drawPackCover(cover: Node, pack: GachaPack, index: number): void {
+function drawPackCover(cover: Node, pack: PackMeta, index: number): void {
   const size = cover.getComponent(UITransform)?.contentSize;
   const width = size?.width || 138;
   const height = size?.height || 104;

@@ -14,19 +14,12 @@ import {
 } from 'cc';
 import {
   FormationDefinition,
+  getFormationsByIds,
   getPreviewFormationPoints,
-  getSelectedFormation,
-  getUnlockedFormations,
   setSelectedFormationId,
 } from '../services/FormationService';
-import {
-  RosterPlayer,
-  assignLineupPlayer,
-  getLineupPlayerIds,
-  getLineupPlayers,
-  getOwnedPlayers,
-  swapLineupPlayers,
-} from '../services/PlayerRosterService';
+import { fetchLineupState, saveLineupState } from '../services/LineupApiService';
+import { RosterPlayer } from '../services/PlayerRosterService';
 import { drawPlayerAvatar, playerCardColors, renderStandardPlayerCard, withAlpha } from '../ui/PlayerCardView';
 import { findNode, rgba } from '../utils/CocosNodeUtils';
 import { bindTabs } from './MainSceneController';
@@ -76,8 +69,9 @@ export function bindPlayersScene(root: Node): void {
 
 class FormationSelector {
   private root: Node;
-  private formations: FormationDefinition[] = getUnlockedFormations();
-  private ownedPlayers: RosterPlayer[] = getOwnedPlayers();
+  private formations: FormationDefinition[] = [];
+  private ownedPlayers: RosterPlayer[] = [];
+  private lineupPlayerIds: string[] = [];
   private cards: Node[] = [];
   private playerCards: Node[] = [];
   private starterSlots: StarterSlot[] = [];
@@ -99,14 +93,33 @@ class FormationSelector {
   }
 
   start(): void {
-    const selected = getSelectedFormation();
-    this.selectedIndex = Math.max(0, this.formations.findIndex((formation) => formation.id === selected.id));
-    this.scrollState.offset = -this.selectedIndex * CARD_SPACING;
     this.prepareViewport();
-    this.createCards();
     this.preparePlayerList();
-    this.createPlayerCards();
     this.prepareStarterInput();
+    this.drawEmptyMainBoard();
+    this.renderSelectorFrame(false);
+    void this.loadInitialState();
+  }
+
+  private async loadInitialState(): Promise<void> {
+    try {
+      const state = await fetchLineupState();
+      this.formations = getFormationsByIds(state.formationIds);
+      this.ownedPlayers = [...state.players];
+      this.lineupPlayerIds = this.normalizeLineupIds(state.lineupPlayerIds);
+      this.selectedIndex = Math.max(0, this.formations.findIndex((formation) => formation.id === state.selectedFormationId));
+      setSelectedFormationId(state.selectedFormationId);
+      this.clearLoadStatus();
+    } catch (error) {
+      this.clearRemoteData();
+      this.drawEmptyMainBoard();
+      this.renderSelectorFrame(false);
+      this.showLoadStatus(error instanceof Error ? error.message : '阵容数据加载失败');
+      return;
+    }
+    this.scrollState.offset = -this.selectedIndex * CARD_SPACING;
+    this.createCards();
+    this.createPlayerCards();
     this.updateSelected(this.selectedIndex, false);
     this.renderCards();
     this.renderPlayerCards();
@@ -199,6 +212,7 @@ class FormationSelector {
   }
 
   private handleTouchMove(event: EventTouch): void {
+    if (this.formations.length === 0) return;
     const delta = event.getUILocation().x - this.touchStartX;
     this.scrollState.offset = clamp(this.touchStartOffset + delta, -(this.formations.length - 1) * CARD_SPACING, 0);
     this.updateSelected(Math.round(-this.scrollState.offset / CARD_SPACING), false);
@@ -206,6 +220,7 @@ class FormationSelector {
   }
 
   private handleTouchEnd(): void {
+    if (this.formations.length === 0) return;
     this.snapTo(Math.round(-this.scrollState.offset / CARD_SPACING), true);
   }
 
@@ -251,7 +266,7 @@ class FormationSelector {
   }
 
   private handleStarterTouchStart(slotIndex: number, event: EventTouch): void {
-    const player = getLineupPlayers()[slotIndex];
+    const player = this.getLineupPlayer(slotIndex);
     if (!player) return;
     const ui = event.getUILocation();
     const point = this.uiToRootPoint(ui.x, ui.y);
@@ -270,9 +285,10 @@ class FormationSelector {
   private endStarterTouch(): void {
     const touch = this.lineupTouch;
     if (touch?.dragging && this.magnetSlot) {
-      swapLineupPlayers(touch.slotIndex, this.magnetSlot.index);
+      this.swapLineupSlots(touch.slotIndex, this.magnetSlot.index);
       this.drawMainBoard(this.formations[this.selectedIndex]);
       this.renderPlayerCards();
+      this.saveCurrentSelection();
     }
     this.lineupTouch = null;
     this.destroyDragGhost();
@@ -293,6 +309,7 @@ class FormationSelector {
   }
 
   private snapTo(index: number, animated: boolean): void {
+    if (this.formations.length === 0) return;
     const targetIndex = clampIndex(index, this.formations.length);
     const targetOffset = -targetIndex * CARD_SPACING;
     Tween.stopAllByTarget(this.scrollState);
@@ -324,6 +341,7 @@ class FormationSelector {
   }
 
   private updateSelected(index: number, persist: boolean): void {
+    if (this.formations.length === 0) return;
     const nextIndex = clampIndex(index, this.formations.length);
     this.selectedIndex = nextIndex;
     const formation = persist ? setSelectedFormationId(this.formations[this.selectedIndex].id) : this.formations[this.selectedIndex];
@@ -331,6 +349,7 @@ class FormationSelector {
   }
 
   private renderCards(): void {
+    if (this.formations.length === 0) return;
     for (let i = 0; i < this.cards.length; i += 1) {
       const card = this.cards[i];
       const x = i * CARD_SPACING + this.scrollState.offset;
@@ -380,7 +399,6 @@ class FormationSelector {
     const g = board.getComponent(Graphics) || board.addComponent(Graphics);
     drawBoard(g, width, height);
     const points = getPreviewFormationPoints(formation, width * 0.72, height * 0.72);
-    const lineup = getLineupPlayers();
     this.starterSlots = [];
     for (let i = 0; i < points.length; i += 1) {
       const starter = findNode(this.root, `Starter_${i + 1}`);
@@ -389,15 +407,17 @@ class FormationSelector {
       const y = boardY + points[i].y;
       this.starterSlots.push({ index: i, x, y });
       if (starter) {
+        starter.active = true;
         starter.setPosition(x, y);
-        drawStarter(starter, lineup[i]);
+        drawStarter(starter, this.getLineupPlayer(i));
       }
       if (labelNode) {
+        labelNode.active = true;
         labelNode.setPosition(x, y - 31);
         labelNode.getComponent(UITransform)?.setContentSize(62, 22);
         const label = labelNode.getComponent(Label);
         if (label) {
-          label.string = lineup[i]?.name || String(i + 1);
+          label.string = this.getLineupPlayer(i)?.name || String(i + 1);
           label.fontSize = 11;
           label.lineHeight = 13;
         }
@@ -406,7 +426,15 @@ class FormationSelector {
   }
 
   private saveCurrentSelection(): void {
+    if (this.formations.length === 0) return;
     setSelectedFormationId(this.formations[this.selectedIndex].id);
+    void saveLineupState(this.formations[this.selectedIndex].id, this.lineupPlayerIds).then((state) => {
+      this.ownedPlayers = [...state.players];
+      this.lineupPlayerIds = this.normalizeLineupIds(state.lineupPlayerIds);
+      this.clearLoadStatus();
+    }).catch((error: Error) => {
+      this.showLoadStatus(error.message || '阵容保存失败');
+    });
   }
 
   private renderPlayerCards(): void {
@@ -414,7 +442,6 @@ class FormationSelector {
     const width = viewport?.getComponent(UITransform)?.contentSize.width || 348;
     const startX = -width / 2 + PLAYER_CARD_WIDTH / 2 + 8;
     const startY = (viewport?.getComponent(UITransform)?.contentSize.height || 148) / 2 - PLAYER_CARD_HEIGHT / 2 - 6;
-    const lineupIds = getLineupPlayerIds();
     for (let i = 0; i < this.playerCards.length; i += 1) {
       const card = this.playerCards[i];
       const col = i % PLAYER_COLUMNS;
@@ -426,7 +453,7 @@ class FormationSelector {
       renderStandardPlayerCard(card, this.ownedPlayers[i], {
         width: PLAYER_CARD_WIDTH,
         height: PLAYER_CARD_HEIGHT,
-        selected: lineupIds.indexOf(this.ownedPlayers[i].id) >= 0,
+        selected: this.lineupPlayerIds.indexOf(this.ownedPlayers[i].id) >= 0,
         nameFontSize: 9,
         scoreFontSize: 8,
         avatarRadius: 14,
@@ -472,9 +499,14 @@ class FormationSelector {
   }
 
   private assignPlayerToSlot(player: RosterPlayer, slotIndex: number): void {
-    assignLineupPlayer(slotIndex, player.id);
+    const existingIndex = this.lineupPlayerIds.indexOf(player.id);
+    if (existingIndex >= 0 && existingIndex !== slotIndex) {
+      this.lineupPlayerIds[existingIndex] = this.lineupPlayerIds[slotIndex];
+    }
+    this.lineupPlayerIds[slotIndex] = player.id;
     this.drawMainBoard(this.formations[this.selectedIndex]);
     this.renderPlayerCards();
+    this.saveCurrentSelection();
   }
 
   private createDragGhost(player: RosterPlayer, x: number, y: number): void {
@@ -556,6 +588,88 @@ class FormationSelector {
     const rows = Math.ceil(this.ownedPlayers.length / PLAYER_COLUMNS);
     const contentHeight = rows * PLAYER_CARD_HEIGHT + Math.max(0, rows - 1) * PLAYER_CARD_GAP_Y + 12;
     return Math.max(0, contentHeight - viewportHeight);
+  }
+
+  private drawEmptyMainBoard(): void {
+    const board = findNode(this.root, 'FormationBoard');
+    if (!board) return;
+    const sprite = board.getComponent(Sprite);
+    if (sprite) sprite.enabled = false;
+    const transform = board.getComponent(UITransform);
+    const width = transform?.contentSize.width || 348;
+    const height = transform?.contentSize.height || 360;
+    const g = board.getComponent(Graphics) || board.addComponent(Graphics);
+    drawBoard(g, width, height);
+    this.starterSlots = [];
+    for (let i = 1; i <= 5; i += 1) {
+      const starter = findNode(this.root, `Starter_${i}`);
+      const labelNode = findNode(this.root, `StarterText_${i}`);
+      if (starter) starter.active = false;
+      if (labelNode) labelNode.active = false;
+    }
+  }
+
+  private clearRemoteData(): void {
+    this.formations = [];
+    this.ownedPlayers = [];
+    this.lineupPlayerIds = [];
+    this.selectedIndex = 0;
+    this.scrollState.offset = 0;
+    this.playerScrollState.offset = 0;
+    this.starterSlots = [];
+    const formationViewport = findNode(this.root, 'FormationCarouselViewport');
+    if (formationViewport) {
+      for (const oldCard of formationViewport.children.filter((child) => child.name.startsWith('FormationCard_'))) oldCard.destroy();
+    }
+    const playerViewport = findNode(this.root, 'PlayerListViewport');
+    if (playerViewport) {
+      for (const oldCard of playerViewport.children.filter((child) => child.name.startsWith('PlayerCard_'))) oldCard.destroy();
+    }
+    this.cards = [];
+    this.playerCards = [];
+  }
+
+  private getLineupPlayer(slotIndex: number): RosterPlayer | null {
+    const playerId = this.lineupPlayerIds[slotIndex];
+    if (!playerId) return null;
+    return this.ownedPlayers.find((player) => player.id === playerId) || null;
+  }
+
+  private swapLineupSlots(fromIndex: number, toIndex: number): void {
+    if (fromIndex < 0 || fromIndex >= this.lineupPlayerIds.length || toIndex < 0 || toIndex >= this.lineupPlayerIds.length || fromIndex === toIndex) return;
+    const current = this.lineupPlayerIds[fromIndex];
+    this.lineupPlayerIds[fromIndex] = this.lineupPlayerIds[toIndex];
+    this.lineupPlayerIds[toIndex] = current;
+  }
+
+  private normalizeLineupIds(incoming: string[]): string[] {
+    const validIds = new Set(this.ownedPlayers.map((player) => player.id));
+    const normalized = incoming.filter((id) => validIds.has(id)).slice(0, 5);
+    while (normalized.length < 5) normalized.push('');
+    return normalized;
+  }
+
+  private showLoadStatus(message: string, success = false): void {
+    this.clearLoadStatus();
+    const status = new Node('RosterLoadStatus');
+    status.layer = this.root.layer;
+    this.root.addChild(status);
+    status.setPosition(0, -6);
+    status.addComponent(UITransform).setContentSize(300, 46);
+    const label = status.addComponent(Label);
+    label.string = message;
+    label.fontSize = 14;
+    label.lineHeight = 18;
+    label.cacheMode = Label.CacheMode.NONE;
+    label.horizontalAlign = Label.HorizontalAlign.CENTER;
+    label.verticalAlign = Label.VerticalAlign.CENTER;
+    label.enableWrapText = true;
+    label.overflow = Label.Overflow.CLAMP;
+    label.color = success ? rgba(151, 255, 176) : rgba(255, 226, 168);
+  }
+
+  private clearLoadStatus(): void {
+    findNode(this.root, 'RosterLoadStatus')?.destroy();
   }
 }
 

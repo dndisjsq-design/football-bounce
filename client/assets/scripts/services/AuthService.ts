@@ -1,6 +1,9 @@
 import { sys } from 'cc';
+import { setCurrentCoins } from './WalletService';
 
-export const AUTH_API_BASE_URL = 'http://127.0.0.1:8080/api';
+const DEV_BACKEND_HOST = '192.168.3.44';
+
+export const AUTH_API_BASE_URL = resolveApiBaseUrl();
 
 export type AuthCode = 'SUCCESS' | 'WRONG_PASSWORD' | 'USER_NOT_FOUND' | 'USERNAME_EXISTS' | 'INVALID_SESSION' | 'INVALID_REQUEST' | 'ERROR';
 
@@ -11,6 +14,7 @@ export interface AuthResponse {
     id: number;
     username: string;
     displayName: string;
+    coins?: number;
   };
   authToken?: string;
   expiresAt?: string;
@@ -20,6 +24,16 @@ const DEVICE_ID_KEY = 'footballBounce.deviceId';
 const AUTH_TOKEN_KEY = 'footballBounce.authToken';
 const AUTH_USER_KEY = 'footballBounce.authUser';
 const AUTH_EXPIRES_AT_KEY = 'footballBounce.authExpiresAt';
+const GUEST_USER_ID = 1;
+
+function resolveApiBaseUrl(): string {
+  const browserLocation = (globalThis as { location?: { protocol?: string; hostname?: string } }).location;
+  if (browserLocation?.hostname && browserLocation.hostname !== 'localhost' && browserLocation.hostname !== '127.0.0.1') {
+    return `${browserLocation.protocol || 'http:'}//${browserLocation.hostname}:8080/api`;
+  }
+  if (sys.isNative) return `http://${DEV_BACKEND_HOST}:8080/api`;
+  return 'http://127.0.0.1:8080/api';
+}
 
 export function authMessage(response: AuthResponse): string {
   if (response.message) return response.message;
@@ -39,6 +53,18 @@ export function loginWithPassword(username: string, password: string): Promise<A
 
 export function registerAccount(username: string, password: string): Promise<AuthResponse> {
   return postAuth('/auth/register', { username, password });
+}
+
+export function loginAsGuest(): void {
+  sys.localStorage.removeItem(AUTH_TOKEN_KEY);
+  sys.localStorage.removeItem(AUTH_EXPIRES_AT_KEY);
+  sys.localStorage.setItem(AUTH_USER_KEY, JSON.stringify({
+    id: GUEST_USER_ID,
+    username: 'guest',
+    displayName: '游客 10086',
+    coins: 100000,
+  }));
+  setCurrentCoins(100000);
 }
 
 export function tryAutoLogin(): Promise<AuthResponse | null> {
@@ -75,6 +101,17 @@ export function getCurrentUserDisplayName(): string {
   }
 }
 
+export function getCurrentUserId(): number | null {
+  const saved = sys.localStorage.getItem(AUTH_USER_KEY);
+  if (!saved) return null;
+  try {
+    const user = JSON.parse(saved) as { id?: number };
+    return typeof user.id === 'number' ? user.id : null;
+  } catch {
+    return null;
+  }
+}
+
 export function clearAuthSession(): void {
   sys.localStorage.removeItem(AUTH_TOKEN_KEY);
   sys.localStorage.removeItem(AUTH_USER_KEY);
@@ -84,6 +121,7 @@ export function clearAuthSession(): void {
 function saveAuthSession(response: AuthResponse): void {
   if (response.code !== 'SUCCESS') return;
   if (response.user) sys.localStorage.setItem(AUTH_USER_KEY, JSON.stringify(response.user));
+  if (typeof response.user?.coins === 'number') setCurrentCoins(response.user.coins);
   if (response.authToken) sys.localStorage.setItem(AUTH_TOKEN_KEY, response.authToken);
   if (response.expiresAt) sys.localStorage.setItem(AUTH_EXPIRES_AT_KEY, response.expiresAt);
 }
