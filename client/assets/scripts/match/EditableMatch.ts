@@ -1,4 +1,4 @@
-import { Color, EventTouch, Graphics, Label, Node, Sprite, Touch, UITransform, Vec2, Vec3 } from 'cc';
+import { Color, director, EventTouch, Graphics, Label, Node, Sprite, Touch, UITransform, Vec2, Vec3 } from 'cc';
 import { MatchTransport } from '../MatchTransport';
 import { BallState, DiscBodyState, MatchEvent, MatchMode, MatchSnapshot, PlayerDiskState, ShootCommand, TeamSide } from '../MatchTypes';
 import { getCurrentUserDisplayName } from '../services/AuthService';
@@ -40,6 +40,16 @@ const PENALTY_DEPTH = 86;
 const MATCH_SECONDS = 180;
 const TURN_SECONDS = 15;
 const WIN_SCORE = 3;
+const GOAL_CELEBRATION_SECONDS = 3;
+
+interface GoalRecord {
+  side: TeamSide;
+  actorId: string;
+  playerName: string;
+  timeText: string;
+  elapsedSeconds: number;
+  order: number;
+}
 
 interface CurveMotion {
   remainingAngle: number;
@@ -74,6 +84,14 @@ export class EditableMatch {
   private matchRemaining = MATCH_SECONDS;
   private turnRemaining = TURN_SECONDS;
   private matchEnded = false;
+  private goalCelebrationRemaining = 0;
+  private goalCelebrationElapsed = 0;
+  private goalScorer: TeamSide | null = null;
+  private pendingKickoffTurn: TeamSide = 'home';
+  private victorySide: TeamSide | null = null;
+  private goalRecords: GoalRecord[] = [];
+  private lastShotActorId = '';
+  private goalOrder = 0;
 
   constructor(canvas: Node, mode: MatchMode, transport: MatchTransport) {
     this.canvas = canvas;
@@ -95,9 +113,10 @@ export class EditableMatch {
   }
 
   tick(dt: number): void {
+    this.updateGoalCelebration(dt);
     this.updateClocks(dt);
     this.step(dt);
-    if (!this.matchEnded && this.mode === 'ai' && this.turn === 'away' && this.isSettled()) {
+    if (!this.matchEnded && this.goalCelebrationRemaining <= 0 && this.mode === 'ai' && this.turn === 'away' && this.isSettled()) {
       this.aiCooldown -= dt;
       if (this.aiCooldown <= 0) {
         this.aiCooldown = 0.8;
@@ -109,10 +128,10 @@ export class EditableMatch {
     this.syncNodes();
   }
 
-  private resetObjects(): void {
+  private resetObjects(startingTurn: TeamSide = 'home'): void {
     const fw = this.fieldWidth;
     const fh = this.fieldHeight;
-    this.turn = 'home';
+    this.turn = startingTurn;
     this.dragActor = null;
     this.dragStart = null;
     this.dragNow = null;
@@ -139,10 +158,14 @@ export class EditableMatch {
     hud.removeAllChildren();
     const width = this.canvas.getComponent(UITransform)?.contentSize.width || 390;
     const pitchTop = this.pitchTopY();
-    this.createHudLabel(hud, 'HudHomeName', getCurrentUserDisplayName(), -width / 2 + 58, pitchTop + 31, 14, rgba(255, 255, 255), Label.HorizontalAlign.LEFT);
-    this.createHudLabel(hud, 'HudAwayName', this.mode === 'ai' ? '电脑' : '对手', width / 2 - 58, pitchTop + 31, 14, rgba(255, 255, 255), Label.HorizontalAlign.RIGHT);
+    this.createHudLabel(hud, 'HudHomeName', this.matchDisplayName(), -width / 2 + 76, pitchTop + 23, 14, rgba(255, 255, 255), Label.HorizontalAlign.LEFT);
+    this.createHudLabel(hud, 'HudAwayName', this.mode === 'ai' ? '电脑' : '对手', width / 2 - 76, pitchTop + 23, 14, rgba(255, 255, 255), Label.HorizontalAlign.RIGHT);
     this.createHudLabel(hud, 'HudMatchTime', formatClock(this.matchRemaining), 0, pitchTop + 25, 22, rgba(255, 246, 178), Label.HorizontalAlign.CENTER)
       .node.getComponent(UITransform)?.setContentSize(82, 28);
+    this.createHudLabel(hud, 'HudGoalLeft', '进', 240, 0, 64, rgba(255, 246, 220), Label.HorizontalAlign.CENTER).node.active = false;
+    this.createHudLabel(hud, 'HudGoalRight', '球', 300, 0, 64, rgba(255, 246, 220), Label.HorizontalAlign.CENTER).node.active = false;
+    this.createHudLabel(hud, 'HudVictoryTitle', '', 0, 42, 34, rgba(255, 246, 178), Label.HorizontalAlign.CENTER).node.active = false;
+    this.createHudLabel(hud, 'HudVictoryScore', '', 0, -4, 24, rgba(255, 255, 255), Label.HorizontalAlign.CENTER).node.active = false;
     this.hudGraphics = hud.getComponent(Graphics) || hud.addComponent(Graphics);
     this.drawMatchHud();
   }
@@ -224,7 +247,7 @@ export class EditableMatch {
           return;
         }
         const current = this.players.find((p) => p.id === playerId);
-        if (this.matchEnded || !current || current.side !== 'home' || this.turn !== 'home' || !this.isSettled()) return;
+        if (this.matchEnded || this.goalCelebrationRemaining > 0 || !current || current.side !== 'home' || this.turn !== 'home' || !this.isSettled()) return;
         this.dragActor = current;
         this.dragStart = new Vec2(current.x, current.y);
         this.powerTouchId = event.touch?.getID() ?? null;
@@ -296,7 +319,7 @@ export class EditableMatch {
       this.clearDragAim();
       return;
     }
-    if (this.matchEnded) {
+    if (this.matchEnded || this.goalCelebrationRemaining > 0) {
       this.clearDragAim();
       return;
     }
@@ -340,6 +363,7 @@ export class EditableMatch {
     const speed = PLAYER_SHOT_SPEED * clamp(command.power, 0, 1);
     actor.vx = Math.cos(shotAngle) * speed;
     actor.vy = Math.sin(shotAngle) * speed;
+    this.lastShotActorId = actor.id;
     if (hasCurve) {
       this.activeCurves.set(actor.id, {
         remainingAngle: -curveAngle * 2,
@@ -572,6 +596,7 @@ export class EditableMatch {
   }
 
   private checkGoal(): void {
+    if (this.goalCelebrationRemaining > 0 || this.matchEnded) return;
     if (Math.abs(this.ball.x) > GOAL_HALF_WIDTH - this.ball.radius) return;
     if (this.ball.y > this.goalLineY + this.ball.radius) this.registerGoal('home');
     if (this.ball.y < -this.goalLineY - this.ball.radius) this.registerGoal('away');
@@ -579,14 +604,16 @@ export class EditableMatch {
 
   private registerGoal(side: TeamSide): void {
     this.score[side] += 1;
+    this.recordGoal(side);
     this.emitMatchEvent({ type: 'goal', side });
+    this.goalScorer = side;
+    this.pendingKickoffTurn = side === 'home' ? 'away' : 'home';
+    this.goalCelebrationRemaining = GOAL_CELEBRATION_SECONDS;
+    this.goalCelebrationElapsed = 0;
+    this.clearDragAim();
     if (this.score[side] >= WIN_SCORE) {
-      this.matchEnded = true;
-      this.clearDragAim();
-      return;
+      this.victorySide = side;
     }
-    this.resetObjects();
-    this.turnRemaining = TURN_SECONDS;
   }
 
   private syncNodes(): void {
@@ -605,12 +632,11 @@ export class EditableMatch {
   }
 
   private updateClocks(dt: number): void {
-    if (this.matchEnded) return;
+    if (this.matchEnded || this.goalCelebrationRemaining > 0) return;
     this.matchRemaining = Math.max(0, this.matchRemaining - dt);
     this.turnRemaining = Math.max(0, this.turnRemaining - dt);
     if (this.matchRemaining <= 0) {
-      this.matchEnded = true;
-      this.clearDragAim();
+      this.endMatchByScore();
       return;
     }
     if (this.turnRemaining <= 0) {
@@ -635,6 +661,267 @@ export class EditableMatch {
     this.drawHudPlayer(g, awayX, topY, 'away', this.turn === 'away' ? this.turnRemaining / TURN_SECONDS : 1, this.turn === 'away' && !this.matchEnded);
     const matchLabel = findNode(hud, 'HudMatchTime')?.getComponent(Label);
     if (matchLabel) matchLabel.string = formatClock(this.matchRemaining);
+    this.drawGoalCelebration(g);
+    this.drawVictoryOverlay(g);
+    this.drawVictorySettlement(g);
+  }
+
+  private matchDisplayName(): string {
+    const name = getCurrentUserDisplayName();
+    return name === '游客 10086' || name.toLowerCase() === 'guest' ? '游客' : name;
+  }
+
+  private updateGoalCelebration(dt: number): void {
+    if (this.goalCelebrationRemaining <= 0) return;
+    this.goalCelebrationRemaining = Math.max(0, this.goalCelebrationRemaining - dt);
+    this.goalCelebrationElapsed += dt;
+    if (this.goalCelebrationRemaining > 0) return;
+    this.hideGoalLabels();
+    if (this.victorySide) {
+      this.matchEnded = true;
+      this.turnRemaining = 0;
+      return;
+    }
+    this.resetObjects(this.pendingKickoffTurn);
+    this.turnRemaining = TURN_SECONDS;
+    this.aiCooldown = 0.8;
+  }
+
+  private drawGoalCelebration(g: Graphics): void {
+    const leftLabel = findNode(this.ensureHudNode(), 'HudGoalLeft');
+    const rightLabel = findNode(this.ensureHudNode(), 'HudGoalRight');
+    if (this.goalCelebrationRemaining <= 0 || !leftLabel || !rightLabel) {
+      this.hideGoalLabels();
+      return;
+    }
+    const width = this.canvas.getComponent(UITransform)?.contentSize.width || 390;
+    const height = this.canvas.getComponent(UITransform)?.contentSize.height || 844;
+    const t = clamp(this.goalCelebrationElapsed / GOAL_CELEBRATION_SECONDS, 0, 1);
+    const slide = easeOutCubic(clamp(t / 0.26, 0, 1));
+    const holdY = 6;
+    leftLabel.active = true;
+    rightLabel.active = true;
+    const textX = width / 2 + 70 - (width / 2 + 70) * slide;
+    leftLabel.setPosition(textX - 34, holdY);
+    rightLabel.setPosition(textX + 34, holdY);
+
+    g.fillColor = rgba(0, 0, 0, 132);
+    g.rect(-width / 2, -height / 2, width, height);
+    g.fill();
+    const barSlide = easeOutCubic(clamp(t / 0.3, 0, 1));
+    const topBarX = -width + width * barSlide;
+    const bottomBarX = width - width * barSlide;
+    g.fillColor = rgba(255, 142, 30, 235);
+    g.rect(topBarX - width / 2, 48, width, 7);
+    g.fill();
+    g.rect(bottomBarX - width / 2, -48, width, 7);
+    g.fill();
+    this.drawConfetti(g, width, height, t);
+  }
+
+  private drawConfetti(g: Graphics, width: number, height: number, t: number): void {
+    if (t < 0.28 || t > 0.98) return;
+    const colors = [rgba(255, 220, 62), rgba(255, 97, 97), rgba(97, 196, 255), rgba(132, 255, 148), rgba(255, 145, 55)];
+    for (let i = 0; i < 34; i += 1) {
+      const side = i % 2 === 0 ? -1 : 1;
+      const seed = i * 37;
+      const burstT = clamp((t - 0.28) / 0.7, 0, 1);
+      const angle = (-0.9 + (seed % 18) * 0.1) * side;
+      const speed = 70 + (seed % 90);
+      const x = side * (32 + (seed % 36)) + Math.cos(angle) * speed * burstT;
+      const y = 10 + Math.sin(angle) * speed * burstT - 70 * burstT * burstT + ((seed % 40) - 20);
+      g.fillColor = colors[i % colors.length];
+      g.rect(x, y, 5, 8);
+      g.fill();
+    }
+  }
+
+  private drawVictorySettlement(g: Graphics): void {
+    const titleNode = findNode(this.ensureHudNode(), 'HudVictoryTitle');
+    const scoreNode = findNode(this.ensureHudNode(), 'HudVictoryScore');
+    if (!this.matchEnded || !this.victorySide || !titleNode || !scoreNode) {
+      if (titleNode) titleNode.active = false;
+      if (scoreNode) scoreNode.active = false;
+      this.clearVictoryRuntimeNodes();
+      return;
+    }
+    const width = this.canvas.getComponent(UITransform)?.contentSize.width || 390;
+    const height = this.canvas.getComponent(UITransform)?.contentSize.height || 844;
+    g.fillColor = rgba(2, 8, 18, 204);
+    g.rect(-width / 2, -height / 2, width, height);
+    g.fill();
+    const isWin = this.victorySide === 'home';
+    g.fillColor = isWin ? rgba(238, 77, 77, 204) : rgba(74, 135, 232, 204);
+    g.roundRect(-160, -238, 320, 488, 8);
+    g.fill();
+    g.strokeColor = rgba(255, 255, 255, 235);
+    g.lineWidth = 3;
+    g.roundRect(-160, -238, 320, 488, 8);
+    g.stroke();
+    titleNode.active = true;
+    scoreNode.active = true;
+    titleNode.setPosition(0, 190);
+    scoreNode.setPosition(0, 152);
+    const title = titleNode.getComponent(Label);
+    const score = scoreNode.getComponent(Label);
+    if (title) title.string = isWin ? '胜利' : '失败';
+    if (score) score.string = `${this.score.away} : ${this.score.home}`;
+    this.drawVictoryTimeline(g);
+    this.ensureVictoryDetails();
+  }
+
+  private drawVictoryOverlay(g: Graphics): void {
+    if (!this.matchEnded || !this.victorySide) return;
+    const width = this.canvas.getComponent(UITransform)?.contentSize.width || 390;
+    const height = this.canvas.getComponent(UITransform)?.contentSize.height || 844;
+    g.fillColor = rgba(0, 0, 0, 82);
+    g.rect(-width / 2, -height / 2, width, height);
+    g.fill();
+  }
+
+  private hideGoalLabels(): void {
+    const hud = this.ensureHudNode();
+    const leftLabel = findNode(hud, 'HudGoalLeft');
+    const rightLabel = findNode(hud, 'HudGoalRight');
+    if (leftLabel) leftLabel.active = false;
+    if (rightLabel) rightLabel.active = false;
+  }
+
+  private recordGoal(side: TeamSide): void {
+    const actorId = this.lastShotActorId && this.lastShotActorId.startsWith(side) ? this.lastShotActorId : `${side}-1`;
+    this.goalRecords.push({
+      side,
+      actorId,
+      playerName: this.matchPlayerName(actorId, side),
+      timeText: formatClock(MATCH_SECONDS - this.matchRemaining),
+      elapsedSeconds: MATCH_SECONDS - this.matchRemaining,
+      order: this.goalOrder,
+    });
+    this.goalOrder += 1;
+  }
+
+  private endMatchByScore(): void {
+    this.clearDragAim();
+    if (this.score.home === this.score.away) {
+      this.matchEnded = true;
+      this.victorySide = this.score.home >= this.score.away ? 'home' : 'away';
+      return;
+    }
+    this.victorySide = this.score.home > this.score.away ? 'home' : 'away';
+    this.matchEnded = true;
+  }
+
+  private matchPlayerName(actorId: string, side: TeamSide): string {
+    const index = playerSlotIndex(actorId);
+    if (side === 'home') return getLineupPlayers()[index]?.name || `${index + 1}号`;
+    return this.mode === 'ai' ? `电脑${index + 1}号` : `对手${index + 1}号`;
+  }
+
+  private bestPlayer(): { name: string; goals: number; side: TeamSide; actorId: string } | null {
+    if (!this.victorySide) return null;
+    const records = this.goalRecords.filter((record) => record.side === this.victorySide);
+    if (records.length === 0) return null;
+    const counts = new Map<string, { name: string; goals: number; firstOrder: number; actorId: string }>();
+    for (const record of records) {
+      const current = counts.get(record.actorId) || { name: record.playerName, goals: 0, firstOrder: record.order, actorId: record.actorId };
+      current.goals += 1;
+      current.firstOrder = Math.min(current.firstOrder, record.order);
+      counts.set(record.actorId, current);
+    }
+    const best = [...counts.values()].sort((a, b) => b.goals - a.goals || a.firstOrder - b.firstOrder)[0];
+    return { name: best.name, goals: best.goals, side: this.victorySide, actorId: best.actorId };
+  }
+
+  private ensureVictoryDetails(): void {
+    const hud = this.ensureHudNode();
+    if (findNode(hud, 'VictoryReturnButton')) return;
+    const best = this.bestPlayer();
+    this.createHudLabel(hud, 'VictoryBestTitle', '本场最佳球员', 0, 108, 16, rgba(255, 246, 178), Label.HorizontalAlign.CENTER);
+    const avatar = new Node('VictoryBestAvatar');
+    avatar.layer = hud.layer;
+    hud.addChild(avatar);
+    avatar.setPosition(-88, 68);
+    avatar.addComponent(UITransform).setContentSize(38, 38);
+    const avatarG = avatar.addComponent(Graphics);
+    drawGenericMatchAvatar(avatarG, 0, 0, 15, best?.side || 'home');
+    this.createHudLabel(hud, 'VictoryBestName', best?.name || '-', -24, 68, 16, rgba(255, 255, 255), Label.HorizontalAlign.CENTER);
+    this.createHudLabel(hud, 'VictoryBestGoals', `${best?.goals || 0} 球`, 72, 68, 16, rgba(255, 255, 255), Label.HorizontalAlign.CENTER);
+    this.createTimelineLabels(hud);
+    this.createVictoryReturnButton(hud);
+  }
+
+  private createTimelineLabels(hud: Node): void {
+    for (const record of this.goalRecords) {
+      const y = this.timelineY(record.elapsedSeconds);
+      const x = record.side === 'home' ? -82 : 82;
+      const align = record.side === 'home' ? Label.HorizontalAlign.RIGHT : Label.HorizontalAlign.LEFT;
+      this.createHudLabel(hud, `VictoryGoal_${record.order}`, `${record.timeText}  ${record.playerName}`, x, y, 13, rgba(255, 255, 255), align)
+        .node.getComponent(UITransform)?.setContentSize(126, 20);
+    }
+    this.createHudLabel(hud, 'VictoryTimelineStart', '0:00', 0, this.timelineTopY() + 18, 12, rgba(255, 255, 255), Label.HorizontalAlign.CENTER)
+      .node.getComponent(UITransform)?.setContentSize(60, 18);
+    this.createHudLabel(hud, 'VictoryTimelineEnd', '3:00', 0, this.timelineBottomY() - 18, 12, rgba(255, 255, 255), Label.HorizontalAlign.CENTER)
+      .node.getComponent(UITransform)?.setContentSize(60, 18);
+  }
+
+  private drawVictoryTimeline(g: Graphics): void {
+    const startY = this.timelineTopY();
+    const endY = this.timelineBottomY();
+    g.strokeColor = rgba(255, 255, 255, 170);
+    g.lineWidth = 2;
+    g.moveTo(0, startY);
+    g.lineTo(0, endY);
+    g.stroke();
+    g.fillColor = rgba(255, 255, 255, 220);
+    g.circle(0, startY, 4);
+    g.fill();
+    g.circle(0, endY, 4);
+    g.fill();
+    for (const record of this.goalRecords) {
+      const y = this.timelineY(record.elapsedSeconds);
+      const sideX = record.side === 'home' ? -24 : 24;
+      g.fillColor = record.side === 'home' ? rgba(255, 110, 90, 240) : rgba(90, 154, 255, 240);
+      g.circle(0, y, 4);
+      g.fill();
+      g.strokeColor = rgba(255, 255, 255, 150);
+      g.lineWidth = 1.5;
+      g.moveTo(0, y);
+      g.lineTo(sideX, y);
+      g.stroke();
+    }
+  }
+
+  private timelineTopY(): number {
+    return 28;
+  }
+
+  private timelineBottomY(): number {
+    return -142;
+  }
+
+  private timelineY(elapsedSeconds: number): number {
+    return this.timelineTopY() - clamp(elapsedSeconds / MATCH_SECONDS, 0, 1) * (this.timelineTopY() - this.timelineBottomY());
+  }
+
+  private createVictoryReturnButton(hud: Node): void {
+    const button = new Node('VictoryReturnButton');
+    button.layer = hud.layer;
+    hud.addChild(button);
+    button.setPosition(0, -194);
+    button.addComponent(UITransform).setContentSize(128, 42);
+    const g = button.addComponent(Graphics);
+    g.fillColor = rgba(255, 255, 255, 228);
+    g.roundRect(-64, -21, 128, 42, 8);
+    g.fill();
+    this.createHudLabel(button, 'VictoryReturnLabel', '返回', 0, 0, 18, rgba(24, 38, 58), Label.HorizontalAlign.CENTER);
+    button.on(Node.EventType.TOUCH_END, () => director.loadScene('Home'));
+  }
+
+  private clearVictoryRuntimeNodes(): void {
+    const hud = this.ensureHudNode();
+    for (const child of [...hud.children]) {
+      if (child.name.startsWith('Victory')) child.destroy();
+    }
   }
 
   private drawHudPlayer(g: Graphics, x: number, y: number, side: TeamSide, ratio: number, active: boolean): void {
@@ -1774,6 +2061,11 @@ function formatClock(seconds: number): string {
   const minutes = Math.floor(clamped / 60);
   const rest = clamped % 60;
   return `${minutes}:${rest < 10 ? '0' : ''}${rest}`;
+}
+
+function easeOutCubic(t: number): number {
+  const p = clamp(t, 0, 1) - 1;
+  return p * p * p + 1;
 }
 
 function curvePointAtArcDistance(distance: number, arcDistance: number, angleRad: number): { x: number; y: number } {
