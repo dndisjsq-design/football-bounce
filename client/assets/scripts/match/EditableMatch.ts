@@ -1,6 +1,7 @@
 import { Color, EventTouch, Graphics, Label, Node, Sprite, Touch, UITransform, Vec2, Vec3 } from 'cc';
 import { MatchTransport } from '../MatchTransport';
 import { BallState, DiscBodyState, MatchEvent, MatchMode, MatchSnapshot, PlayerDiskState, ShootCommand, TeamSide } from '../MatchTypes';
+import { getCurrentUserDisplayName } from '../services/AuthService';
 import { getMatchFormationPoints } from '../services/FormationService';
 import { RosterPlayer, getLineupPlayers } from '../services/PlayerRosterService';
 import { findNode, rgba } from '../utils/CocosNodeUtils';
@@ -36,6 +37,9 @@ const CORNER_CUSHION_RADIUS = 36;
 const CORNER_CUSHION_RESTITUTION = 0.92;
 const PENALTY_HALF_WIDTH = GOAL_HALF_WIDTH + 34;
 const PENALTY_DEPTH = 86;
+const MATCH_SECONDS = 180;
+const TURN_SECONDS = 15;
+const WIN_SCORE = 3;
 
 interface CurveMotion {
   remainingAngle: number;
@@ -57,13 +61,19 @@ export class EditableMatch {
   private curveTouchId: number | null = null;
   private curveTouchStart: Vec2 | null = null;
   private curveTouchPoint: Vec2 | null = null;
+  private curveBaseOffset = 0;
+  private curveCurrentOffset = 0;
   private activeCurves = new Map<string, CurveMotion>();
   private aiCooldown = 0.8;
   private tickIndex = 0;
   private ballSpinDeg = 0;
   private fieldGraphics: Graphics | null = null;
   private aimGraphics: Graphics | null = null;
+  private hudGraphics: Graphics | null = null;
   private appliedCommandIds = new Set<string>();
+  private matchRemaining = MATCH_SECONDS;
+  private turnRemaining = TURN_SECONDS;
+  private matchEnded = false;
 
   constructor(canvas: Node, mode: MatchMode, transport: MatchTransport) {
     this.canvas = canvas;
@@ -79,13 +89,15 @@ export class EditableMatch {
     void this.transport.connect(MATCH_ID).catch(() => undefined);
     this.resetObjects();
     this.prepareMatchRenderer();
+    this.prepareMatchHud();
     this.attachPlayerInput();
     this.syncNodes();
   }
 
   tick(dt: number): void {
+    this.updateClocks(dt);
     this.step(dt);
-    if (this.mode === 'ai' && this.turn === 'away' && this.isSettled()) {
+    if (!this.matchEnded && this.mode === 'ai' && this.turn === 'away' && this.isSettled()) {
       this.aiCooldown -= dt;
       if (this.aiCooldown <= 0) {
         this.aiCooldown = 0.8;
@@ -108,6 +120,8 @@ export class EditableMatch {
     this.curveTouchId = null;
     this.curveTouchStart = null;
     this.curveTouchPoint = null;
+    this.curveBaseOffset = 0;
+    this.curveCurrentOffset = 0;
     this.activeCurves.clear();
     this.ball = makeBall(0, 0);
     this.ballSpinDeg = 0;
@@ -118,6 +132,19 @@ export class EditableMatch {
       ...awayPoints.map((point, index) => makePlayer(`away-${index + 1}`, 'away', point.x, point.y)),
     ];
     this.resolveAllCollisions();
+  }
+
+  private prepareMatchHud(): void {
+    const hud = this.ensureHudNode();
+    hud.removeAllChildren();
+    const width = this.canvas.getComponent(UITransform)?.contentSize.width || 390;
+    const pitchTop = this.pitchTopY();
+    this.createHudLabel(hud, 'HudHomeName', getCurrentUserDisplayName(), -width / 2 + 58, pitchTop + 31, 14, rgba(255, 255, 255), Label.HorizontalAlign.LEFT);
+    this.createHudLabel(hud, 'HudAwayName', this.mode === 'ai' ? '电脑' : '对手', width / 2 - 58, pitchTop + 31, 14, rgba(255, 255, 255), Label.HorizontalAlign.RIGHT);
+    this.createHudLabel(hud, 'HudMatchTime', formatClock(this.matchRemaining), 0, pitchTop + 25, 22, rgba(255, 246, 178), Label.HorizontalAlign.CENTER)
+      .node.getComponent(UITransform)?.setContentSize(82, 28);
+    this.hudGraphics = hud.getComponent(Graphics) || hud.addComponent(Graphics);
+    this.drawMatchHud();
   }
 
   private prepareMatchRenderer(): void {
@@ -197,13 +224,15 @@ export class EditableMatch {
           return;
         }
         const current = this.players.find((p) => p.id === playerId);
-        if (!current || current.side !== 'home' || this.turn !== 'home' || !this.isSettled()) return;
+        if (this.matchEnded || !current || current.side !== 'home' || this.turn !== 'home' || !this.isSettled()) return;
         this.dragActor = current;
         this.dragStart = new Vec2(current.x, current.y);
         this.powerTouchId = event.touch?.getID() ?? null;
         this.curveTouchId = null;
         this.curveTouchStart = null;
         this.curveTouchPoint = null;
+        this.curveBaseOffset = 0;
+        this.curveCurrentOffset = 0;
         this.updateDragTouches(event);
       });
       node.on(Node.EventType.TOUCH_MOVE, (event: EventTouch) => {
@@ -232,6 +261,7 @@ export class EditableMatch {
       this.curveTouchId = null;
       this.curveTouchStart = null;
       this.curveTouchPoint = null;
+      this.curveBaseOffset = this.curveCurrentOffset;
       return;
     }
     const curveTouch = curveTouches.find((touch) => touch.getID() === this.curveTouchId) || curveTouches[0];
@@ -239,8 +269,10 @@ export class EditableMatch {
     if (this.curveTouchId !== curveTouch.getID()) {
       this.curveTouchId = curveTouch.getID();
       this.curveTouchStart = new Vec2(curvePoint.x, curvePoint.y);
+      this.curveBaseOffset = this.curveCurrentOffset;
     }
     this.curveTouchPoint = curvePoint;
+    this.updateCurveOffsetFromTouch();
   }
 
   private handleDragTouchEnd(event: EventTouch): void {
@@ -254,12 +286,17 @@ export class EditableMatch {
       this.curveTouchId = null;
       this.curveTouchStart = null;
       this.curveTouchPoint = null;
+      this.curveBaseOffset = this.curveCurrentOffset;
     }
     this.updateDragTouches(event);
   }
 
   private releaseShot(): void {
     if (!this.dragActor || !this.dragStart || !this.dragNow) {
+      this.clearDragAim();
+      return;
+    }
+    if (this.matchEnded) {
       this.clearDragAim();
       return;
     }
@@ -312,6 +349,7 @@ export class EditableMatch {
       this.activeCurves.delete(actor.id);
     }
     this.turn = this.turn === 'home' ? 'away' : 'home';
+    this.turnRemaining = TURN_SECONDS;
     this.emitMatchEvent({ type: 'shoot', side: command.side, actorId: actor.id });
   }
 
@@ -335,6 +373,7 @@ export class EditableMatch {
   }
 
   private step(dt: number): void {
+    if (this.matchEnded) return;
     const subSteps = Math.max(1, Math.ceil(dt / (1 / 120)));
     const subDt = dt / subSteps;
     for (let i = 0; i < subSteps; i++) {
@@ -541,7 +580,13 @@ export class EditableMatch {
   private registerGoal(side: TeamSide): void {
     this.score[side] += 1;
     this.emitMatchEvent({ type: 'goal', side });
+    if (this.score[side] >= WIN_SCORE) {
+      this.matchEnded = true;
+      this.clearDragAim();
+      return;
+    }
     this.resetObjects();
+    this.turnRemaining = TURN_SECONDS;
   }
 
   private syncNodes(): void {
@@ -554,8 +599,241 @@ export class EditableMatch {
     const scoreLabel = findNode(this.canvas, 'TextScore')?.getComponent(Label);
     if (scoreLabel) scoreLabel.string = `${this.score.away} : ${this.score.home}`;
     const turnLabel = findNode(this.canvas, 'TextTurn')?.getComponent(Label);
-    if (turnLabel) turnLabel.string = this.turn === 'home' ? '我方回合' : '对方回合';
+    if (turnLabel) turnLabel.string = '';
+    this.drawMatchHud();
     this.drawAimIndicator();
+  }
+
+  private updateClocks(dt: number): void {
+    if (this.matchEnded) return;
+    this.matchRemaining = Math.max(0, this.matchRemaining - dt);
+    this.turnRemaining = Math.max(0, this.turnRemaining - dt);
+    if (this.matchRemaining <= 0) {
+      this.matchEnded = true;
+      this.clearDragAim();
+      return;
+    }
+    if (this.turnRemaining <= 0) {
+      this.clearDragAim();
+      this.turn = this.turn === 'home' ? 'away' : 'home';
+      this.turnRemaining = TURN_SECONDS;
+      this.aiCooldown = 0.8;
+    }
+  }
+
+  private drawMatchHud(): void {
+    const hud = this.ensureHudNode();
+    const g = this.hudGraphics || hud.getComponent(Graphics) || hud.addComponent(Graphics);
+    this.hudGraphics = g;
+    const width = this.canvas.getComponent(UITransform)?.contentSize.width || 390;
+    const pitchTop = this.pitchTopY();
+    const topY = pitchTop;
+    const homeX = -width / 2 + 10;
+    const awayX = width / 2 - 10;
+    g.clear();
+    this.drawHudPlayer(g, homeX, topY, 'home', this.turn === 'home' ? this.turnRemaining / TURN_SECONDS : 1, this.turn === 'home' && !this.matchEnded);
+    this.drawHudPlayer(g, awayX, topY, 'away', this.turn === 'away' ? this.turnRemaining / TURN_SECONDS : 1, this.turn === 'away' && !this.matchEnded);
+    const matchLabel = findNode(hud, 'HudMatchTime')?.getComponent(Label);
+    if (matchLabel) matchLabel.string = formatClock(this.matchRemaining);
+  }
+
+  private drawHudPlayer(g: Graphics, x: number, y: number, side: TeamSide, ratio: number, active: boolean): void {
+    const isHome = side === 'home';
+    const baseColor = isHome ? rgba(224, 45, 45, 232) : rgba(45, 108, 224, 232);
+    const avatarColor = isHome ? rgba(238, 77, 77) : rgba(74, 135, 232);
+    const scale = active ? 1.08 : 1;
+    const panelWidth = 132 * scale;
+    const panelHeight = 30 * scale;
+    const barHeight = 8 * scale;
+    const barY = y;
+    const panelBottom = barY + barHeight;
+    const panelLeft = isHome ? x : x - panelWidth;
+    const panelRight = isHome ? x + panelWidth : x;
+    if (active) this.strokeHudTrapezoidGlow(g, panelLeft, panelRight, panelBottom, panelHeight, side);
+    this.fillHudTrapezoid(g, panelLeft, panelRight, panelBottom, panelHeight, side);
+
+    const avatarX = isHome ? panelLeft + 25 * scale : panelRight - 25 * scale;
+    const avatarY = panelBottom + 15;
+    g.fillColor = avatarColor;
+    g.circle(avatarX, avatarY, 13 * scale);
+    g.fill();
+    g.strokeColor = rgba(255, 255, 255, 220);
+    g.lineWidth = active ? 3 : 2;
+    g.circle(avatarX, avatarY, 13 * scale);
+    g.stroke();
+    drawGenericMatchAvatar(g, avatarX, avatarY + 1, 8.5 * scale, side);
+
+    const panelSlant = 24;
+    const barSlant = panelSlant * (barHeight / panelHeight);
+    const barWidth = panelWidth + barSlant;
+    const barX = isHome ? panelLeft : panelRight - barWidth;
+    this.fillTurnBarShape(g, barX, barY, barWidth, barHeight, barSlant, side, rgba(0, 0, 0, 175));
+    const fillWidth = barWidth * clamp(ratio, 0, 1);
+    const fillX = isHome ? barX : barX + (barWidth - fillWidth);
+    this.fillStripedTurnBar(g, fillX, barY, fillWidth, barHeight, barSlant, side);
+    g.strokeColor = rgba(255, 255, 255, 235);
+    g.lineWidth = 1;
+    this.traceTurnBarShape(g, barX, barY, barWidth, barHeight, barSlant, side);
+    g.stroke();
+  }
+
+  private fillHudTrapezoid(g: Graphics, left: number, right: number, bottom: number, height: number, side: TeamSide): void {
+    const slant = 24;
+    const top = bottom + height;
+    g.fillColor = side === 'home' ? rgba(224, 45, 45, 232) : rgba(45, 108, 224, 232);
+    if (side === 'home') {
+      g.moveTo(left, bottom);
+      g.lineTo(right, bottom);
+      g.lineTo(right - slant, top);
+      g.lineTo(left, top);
+    } else {
+      g.moveTo(left, bottom);
+      g.lineTo(right, bottom);
+      g.lineTo(right, top);
+      g.lineTo(left + slant, top);
+    }
+    g.close();
+    g.fill();
+    g.strokeColor = rgba(255, 255, 255, 230);
+    g.lineWidth = 2;
+    if (side === 'home') {
+      g.moveTo(left, bottom);
+      g.lineTo(right, bottom);
+      g.lineTo(right - slant, top);
+      g.lineTo(left, top);
+    } else {
+      g.moveTo(left, bottom);
+      g.lineTo(right, bottom);
+      g.lineTo(right, top);
+      g.lineTo(left + slant, top);
+    }
+    g.close();
+    g.stroke();
+  }
+
+  private strokeHudTrapezoidGlow(g: Graphics, left: number, right: number, bottom: number, height: number, side: TeamSide): void {
+    const glowColor = side === 'home' ? rgba(255, 92, 92, 120) : rgba(96, 162, 255, 120);
+    this.strokeHudTrapezoid(g, left, right, bottom, height, side, glowColor, 10);
+    this.strokeHudTrapezoid(g, left, right, bottom, height, side, glowColor, 5);
+  }
+
+  private strokeHudTrapezoid(g: Graphics, left: number, right: number, bottom: number, height: number, side: TeamSide, color: Color, width: number): void {
+    const slant = 24;
+    const top = bottom + height;
+    g.strokeColor = color;
+    g.lineWidth = width;
+    if (side === 'home') {
+      g.moveTo(left, bottom);
+      g.lineTo(right, bottom);
+      g.lineTo(right - slant, top);
+      g.lineTo(left, top);
+    } else {
+      g.moveTo(left, bottom);
+      g.lineTo(right, bottom);
+      g.lineTo(right, top);
+      g.lineTo(left + slant, top);
+    }
+    g.close();
+    g.stroke();
+  }
+
+  private fillTurnBarShape(g: Graphics, x: number, y: number, width: number, height: number, slant: number, side: TeamSide, color: Color): void {
+    g.fillColor = color;
+    this.traceTurnBarShape(g, x, y, width, height, slant, side);
+    g.fill();
+  }
+
+  private traceTurnBarShape(g: Graphics, x: number, y: number, width: number, height: number, slant: number, side: TeamSide): void {
+    if (side === 'home') {
+      g.moveTo(x, y);
+      g.lineTo(x + width, y);
+      g.lineTo(x + width - slant, y + height);
+      g.lineTo(x, y + height);
+    } else {
+      g.moveTo(x, y);
+      g.lineTo(x + width, y);
+      g.lineTo(x + width, y + height);
+      g.lineTo(x + slant, y + height);
+    }
+    g.close();
+  }
+
+  private fillStripedTurnBar(g: Graphics, x: number, y: number, width: number, height: number, slant: number, side: TeamSide): void {
+    if (width <= 0) return;
+    const teamColor = side === 'home' ? rgba(232, 54, 54, 255) : rgba(54, 122, 232, 255);
+    this.fillTurnBarShape(g, x, y, width, height, slant, side, teamColor);
+    const stripe = 14;
+    const stripeWidth = 7;
+    for (let sx = -slant - stripe; sx < width + slant; sx += stripe) {
+      g.fillColor = rgba(255, 255, 255, 255);
+      if (side === 'home') {
+        this.fillClippedBarStripe(g, x, y, width, height, sx, stripeWidth, -slant, 0, width - slant);
+      } else {
+        this.fillClippedBarStripe(g, x, y, width, height, sx, stripeWidth, slant, slant, width);
+      }
+    }
+  }
+
+  private fillClippedBarStripe(
+    g: Graphics,
+    x: number,
+    y: number,
+    barWidth: number,
+    height: number,
+    stripeX: number,
+    stripeWidth: number,
+    topOffset: number,
+    topMin: number,
+    topMax: number,
+  ): void {
+    const bottomLeft = clamp(stripeX, 0, barWidth);
+    const bottomRight = clamp(stripeX + stripeWidth, 0, barWidth);
+    const topLeft = clamp(stripeX + topOffset, topMin, topMax);
+    const topRight = clamp(stripeX + stripeWidth + topOffset, topMin, topMax);
+    if (bottomRight <= bottomLeft && topRight <= topLeft) return;
+    g.moveTo(x + bottomLeft, y);
+    g.lineTo(x + bottomRight, y);
+    g.lineTo(x + topRight, y + height);
+    g.lineTo(x + topLeft, y + height);
+    g.close();
+    g.fill();
+  }
+
+  private pitchTopY(): number {
+    const pitch = this.pitchNode;
+    const pitchHeight = pitch?.getComponent(UITransform)?.contentSize.height || this.fieldHeight;
+    return (pitch?.position.y || 0) + pitchHeight / 2;
+  }
+
+  private ensureHudNode(): Node {
+    let hud = findNode(this.canvas, 'RuntimeMatchHud');
+    if (!hud) {
+      hud = new Node('RuntimeMatchHud');
+      hud.layer = this.canvas.layer;
+      this.canvas.addChild(hud);
+      const size = this.canvas.getComponent(UITransform)?.contentSize;
+      hud.addComponent(UITransform).setContentSize(size?.width || 390, size?.height || 844);
+      hud.addComponent(Graphics);
+      hud.setPosition(0, 0);
+    }
+    return hud;
+  }
+
+  private createHudLabel(parent: Node, name: string, text: string, x: number, y: number, fontSize: number, color: Color, align: number): Label {
+    const node = new Node(name);
+    node.layer = parent.layer;
+    parent.addChild(node);
+    node.setPosition(x, y);
+    node.addComponent(UITransform).setContentSize(118, 24);
+    const label = node.addComponent(Label);
+    label.string = text;
+    label.fontSize = fontSize;
+    label.lineHeight = fontSize + 4;
+    label.cacheMode = Label.CacheMode.NONE;
+    label.horizontalAlign = align;
+    label.verticalAlign = Label.VerticalAlign.CENTER;
+    label.color = color;
+    return label;
   }
 
   private drawAimIndicator(): void {
@@ -585,7 +863,7 @@ export class EditableMatch {
 
     g.clear();
     g.node.setPosition(this.dragActor.x, this.dragActor.y);
-    g.node.angle = Math.atan2(ny, nx) * 180 / Math.PI;
+    g.node.angle = 0;
     for (let layer = layerCount; layer >= 1; layer--) {
       const widthRatio = layer === layerCount ? outerLayerFraction : 1;
       const longRadius = innerLongRadius + (layer - 1 + widthRatio) * AIM_LAYER_LONG_WIDTH;
@@ -597,44 +875,42 @@ export class EditableMatch {
         Math.round(16 + 56 * t),
         Math.round(170 - 70 * t),
       );
-      g.ellipse(0, 0, longRadius, shortRadius);
+      this.fillRotatedEllipse(g, 0, 0, longRadius, shortRadius, nx, ny);
       g.fill();
     }
 
     const start = this.dragActor.radius + 8;
     const lineEnd = outerLongRadius * 2;
-    const dashLength = 9;
-    const gap = 7;
+    const dotSpacing = 15;
+    const path = this.buildReflectedAimPath(start, lineEnd, curveAngleRad, nx, ny);
     if (Math.abs(curveAngleRad) > 0.03) {
-      this.strokeCurvedAimLine(g, start, lineEnd, curveAngleRad, dashLength, gap);
+      this.drawAimDots(g, path, dotSpacing);
       return;
     }
-    for (let d = start, index = 0; d < lineEnd; d += dashLength + gap, index++) {
-      const next = Math.min(d + dashLength, lineEnd);
-      const alpha = Math.max(48, 250 - index * 26);
-      this.strokeLine(
-        g,
-        d,
-        0,
-        next,
-        0,
-        rgba(255, 255, 255, alpha),
-        3,
-      );
-    }
+    this.drawAimDots(g, path, dotSpacing);
   }
 
   private curveAngleFromSecondTouch(rawLen: number): number {
-    if (!this.dragActor || !this.dragStart || !this.dragNow || !this.curveTouchStart || !this.curveTouchPoint || rawLen <= this.dragActor.radius) return 0;
+    if (!this.dragActor || !this.dragStart || !this.dragNow || rawLen <= this.dragActor.radius) return 0;
+    const signedOffset = this.curveCurrentOffset;
+    if (Math.abs(signedOffset) <= CURVE_INPUT_DEADZONE) return 0;
+    const curve = clamp((Math.abs(signedOffset) - CURVE_INPUT_DEADZONE) / Math.max(1, rawLen * 0.45), 0, 1);
+    return signedOffset >= 0 ? curve * MAX_CURVE_ANGLE : -curve * MAX_CURVE_ANGLE;
+  }
+
+  private updateCurveOffsetFromTouch(): void {
+    if (!this.dragStart || !this.dragNow || !this.curveTouchStart || !this.curveTouchPoint) return;
+    const dx = this.dragStart.x - this.dragNow.x;
+    const dy = this.dragStart.y - this.dragNow.y;
+    const rawLen = Math.sqrt(dx * dx + dy * dy);
+    if (rawLen <= this.dragActor!.radius) return;
     const ux = (this.dragStart.x - this.dragNow.x) / rawLen;
     const uy = (this.dragStart.y - this.dragNow.y) / rawLen;
     const perpX = -uy;
     const perpY = ux;
     const sx = this.curveTouchPoint.x - this.curveTouchStart.x;
     const sy = this.curveTouchPoint.y - this.curveTouchStart.y;
-    const signedOffset = sx * perpX + sy * perpY;
-    const curve = clamp((Math.abs(signedOffset) - CURVE_INPUT_DEADZONE) / Math.max(1, rawLen * 0.45), 0, 1);
-    return signedOffset >= 0 ? curve * MAX_CURVE_ANGLE : -curve * MAX_CURVE_ANGLE;
+    this.curveCurrentOffset = this.curveBaseOffset + sx * perpX + sy * perpY;
   }
 
   private curveDistanceForShot(power: number): number {
@@ -642,14 +918,229 @@ export class EditableMatch {
     return Math.max(CURVE_MIN_DISTANCE, aimRadius * 2);
   }
 
-  private strokeCurvedAimLine(g: Graphics, start: number, end: number, angleRad: number, dashLength: number, gap: number): void {
-    for (let d = start, index = 0; d < end; d += dashLength + gap, index++) {
-      const next = Math.min(d + dashLength, end);
-      const from = curvePointAtArcDistance(d, end, angleRad);
-      const to = curvePointAtArcDistance(next, end, angleRad);
-      const alpha = Math.max(48, 250 - index * 24);
-      this.strokeLine(g, from.x, from.y, to.x, to.y, rgba(255, 255, 255, alpha), 3);
+  private buildReflectedAimPath(start: number, end: number, angleRad: number, nx: number, ny: number): Vec2[] {
+    if (!this.dragActor) return [];
+    if (Math.abs(angleRad) < 0.03) return this.buildStraightReflectedAimPath(start, end, nx, ny);
+    const step = 5;
+    const path: Vec2[] = [];
+    let previousIdeal = localAimPoint(start, end, angleRad);
+    let simulated = new Vec2(
+      this.dragActor.x + previousIdeal.x * nx - previousIdeal.y * ny,
+      this.dragActor.y + previousIdeal.x * ny + previousIdeal.y * nx,
+    );
+    const firstAdvance = this.advanceAimSegment(new Vec2(this.dragActor.x, this.dragActor.y), simulated.x - this.dragActor.x, simulated.y - this.dragActor.y, true);
+    simulated = firstAdvance.point;
+    path.push(new Vec2(simulated.x - this.dragActor.x, simulated.y - this.dragActor.y));
+    let reflected = firstAdvance.reflected;
+    let reflectDirX = firstAdvance.nextVx;
+    let reflectDirY = firstAdvance.nextVy;
+    for (let d = start; d <= end; d += step) {
+      let worldDx: number;
+      let worldDy: number;
+      if (reflected) {
+        const dirLen = Math.sqrt(reflectDirX * reflectDirX + reflectDirY * reflectDirY) || 1;
+        worldDx = reflectDirX / dirLen * step;
+        worldDy = reflectDirY / dirLen * step;
+      } else {
+        const ideal = localAimPoint(Math.min(d, end), end, angleRad);
+        const localDx = ideal.x - previousIdeal.x;
+        const localDy = ideal.y - previousIdeal.y;
+        worldDx = localDx * nx - localDy * ny;
+        worldDy = localDx * ny + localDy * nx;
+        previousIdeal = ideal;
+      }
+      const advanced = this.advanceAimSegment(simulated, worldDx, worldDy, true);
+      simulated = advanced.point;
+      reflected = reflected || advanced.reflected;
+      reflectDirX = advanced.nextVx;
+      reflectDirY = advanced.nextVy;
+      path.push(new Vec2(simulated.x - this.dragActor.x, simulated.y - this.dragActor.y));
     }
+    return path;
+  }
+
+  private buildStraightReflectedAimPath(start: number, end: number, nx: number, ny: number): Vec2[] {
+    if (!this.dragActor) return [];
+    const path: Vec2[] = [];
+    const step = 5;
+    let current = new Vec2(this.dragActor.x + nx * start, this.dragActor.y + ny * start);
+    current = this.clampAimPoint(current);
+    path.push(new Vec2(current.x - this.dragActor.x, current.y - this.dragActor.y));
+    let vx = nx * step;
+    let vy = ny * step;
+    for (let d = start + step; d <= end; d += step) {
+      const advanced = this.advanceAimSegment(current, vx, vy, true);
+      current = advanced.point;
+      vx = advanced.nextVx;
+      vy = advanced.nextVy;
+      path.push(new Vec2(current.x - this.dragActor.x, current.y - this.dragActor.y));
+    }
+    return path;
+  }
+
+  private advanceAimSegment(from: Vec2, dx: number, dy: number, allowGoalMouth: boolean): { point: Vec2; nextVx: number; nextVy: number; reflected: boolean } {
+    if (!this.dragActor) return { point: new Vec2(from.x + dx, from.y + dy), nextVx: dx, nextVy: dy, reflected: false };
+    let x = from.x;
+    let y = from.y;
+    let vx = dx;
+    let vy = dy;
+    let nextVx = dx;
+    let nextVy = dy;
+    let reflectedAny = false;
+    for (let i = 0; i < 4; i += 1) {
+      const hit = this.firstAimBoundaryHit(x, y, vx, vy, allowGoalMouth);
+      if (!hit) {
+        x += vx;
+        y += vy;
+        break;
+      }
+      const hitX = x + vx * hit.t;
+      const hitY = y + vy * hit.t;
+      const remaining = 1 - hit.t;
+      x = hitX;
+      y = hitY;
+      if (hit.axis === 'x') {
+        vx = -vx;
+        nextVx = -nextVx;
+      } else {
+        vy = -vy;
+        nextVy = -nextVy;
+      }
+      vx *= remaining;
+      vy *= remaining;
+      reflectedAny = true;
+    }
+    const point = this.clampAimPoint(new Vec2(x, y));
+    return { point, nextVx, nextVy, reflected: reflectedAny };
+  }
+
+  private firstAimBoundaryHit(x: number, y: number, vx: number, vy: number, allowGoalMouth: boolean): { t: number; axis: 'x' | 'y' } | null {
+    if (!this.dragActor) return null;
+    const radius = this.dragActor.radius;
+    const sideBounds = this.aimBounds(x, radius, allowGoalMouth);
+    let bestT = Number.POSITIVE_INFINITY;
+    let bestAxis: 'x' | 'y' | null = null;
+    if (vx < 0) {
+      const t = (sideBounds.left - x) / vx;
+      if (t >= 0 && t <= 1 && t < bestT) {
+        bestT = t;
+        bestAxis = 'x';
+      }
+    } else if (vx > 0) {
+      const t = (sideBounds.right - x) / vx;
+      if (t >= 0 && t <= 1 && t < bestT) {
+        bestT = t;
+        bestAxis = 'x';
+      }
+    }
+    if (vy < 0) {
+      const t = this.firstVerticalBoundaryTime(x, y, vx, vy, radius, false, allowGoalMouth);
+      if (t !== null && t < bestT) {
+        bestT = t;
+        bestAxis = 'y';
+      }
+    } else if (vy > 0) {
+      const t = this.firstVerticalBoundaryTime(x, y, vx, vy, radius, true, allowGoalMouth);
+      if (t !== null && t < bestT) {
+        bestT = t;
+        bestAxis = 'y';
+      }
+    }
+    return bestAxis ? { t: Math.max(0, Math.min(1, bestT)), axis: bestAxis } : null;
+  }
+
+  private firstVerticalBoundaryTime(x: number, y: number, vx: number, vy: number, radius: number, topSide: boolean, allowGoalMouth: boolean): number | null {
+    const goalLine = topSide ? this.goalLineY - radius : -this.goalLineY + radius;
+    const backLine = topSide ? this.fieldHeight / 2 : -this.fieldHeight / 2;
+    const candidates: Array<{ t: number; isBackLine: boolean }> = [];
+    const goalT = (goalLine - y) / vy;
+    if (goalT >= 0 && goalT <= 1) candidates.push({ t: goalT, isBackLine: false });
+    const backT = (backLine - y) / vy;
+    if (backT >= 0 && backT <= 1) candidates.push({ t: backT, isBackLine: true });
+    candidates.sort((a, b) => a.t - b.t);
+    for (const candidate of candidates) {
+      const t = candidate.t;
+      const hitX = x + vx * t;
+      const canEnterGoal = allowGoalMouth && Math.abs(hitX) <= GOAL_HALF_WIDTH - radius;
+      if (canEnterGoal && !candidate.isBackLine) continue;
+      return t;
+    }
+    return null;
+  }
+
+  private aimBounds(x: number, radius: number, allowGoalMouth: boolean): { left: number; right: number; top: number; bottom: number } {
+    const left = -this.fieldWidth / 2 + WALL_INSET + radius;
+    const right = this.fieldWidth / 2 - WALL_INSET - radius;
+    const insideGoalMouth = allowGoalMouth && Math.abs(x) <= GOAL_HALF_WIDTH - radius;
+    return {
+      left,
+      right,
+      top: insideGoalMouth ? this.fieldHeight / 2 : this.goalLineY - radius,
+      bottom: insideGoalMouth ? -this.fieldHeight / 2 : -this.goalLineY + radius,
+    };
+  }
+
+  private clampAimPoint(point: Vec2): Vec2 {
+    if (!this.dragActor) return point;
+    const bounds = this.aimBounds(point.x, this.dragActor.radius, true);
+    return new Vec2(clamp(point.x, bounds.left, bounds.right), clamp(point.y, bounds.bottom, bounds.top));
+  }
+
+  private drawAimDots(g: Graphics, path: Vec2[], spacing: number): void {
+    if (path.length < 2) return;
+    const totalLength = pathLength(path);
+    let traveled = 0;
+    let distanceToNextDot = 0;
+    let last = path[0];
+    for (let i = 1; i < path.length; i += 1) {
+      const current = path[i];
+      let segmentDx = current.x - last.x;
+      let segmentDy = current.y - last.y;
+      let segmentLength = Math.sqrt(segmentDx * segmentDx + segmentDy * segmentDy);
+      while (segmentLength > 0.001) {
+        const take = Math.min(segmentLength, distanceToNextDot);
+        const t = take / segmentLength;
+        const next = new Vec2(last.x + segmentDx * t, last.y + segmentDy * t);
+        last = next;
+        segmentLength -= take;
+        segmentDx = current.x - last.x;
+        segmentDy = current.y - last.y;
+        if (distanceToNextDot <= take + 0.001) {
+          traveled += take;
+          this.drawAimDot(g, last.x, last.y, traveled, totalLength);
+          distanceToNextDot = spacing;
+        } else {
+          traveled += take;
+          distanceToNextDot -= take;
+        }
+      }
+      last = current;
+    }
+  }
+
+  private drawAimDot(g: Graphics, x: number, y: number, traveled: number, totalLength: number): void {
+    const t = totalLength > 0 ? clamp(traveled / totalLength, 0, 1) : 0;
+    const radius = 4.5 - 2.2 * t;
+    g.fillColor = rgba(255, 255, 255, 255);
+    g.strokeColor = rgba(0, 0, 0, 210);
+    g.lineWidth = 1.2;
+    g.circle(x, y, radius);
+    g.fill();
+    g.stroke();
+  }
+
+  private fillRotatedEllipse(g: Graphics, cx: number, cy: number, longRadius: number, shortRadius: number, nx: number, ny: number): void {
+    const segments = 56;
+    for (let i = 0; i <= segments; i += 1) {
+      const angle = (i / segments) * Math.PI * 2;
+      const localX = Math.cos(angle) * longRadius;
+      const localY = Math.sin(angle) * shortRadius;
+      const x = cx + localX * nx - localY * ny;
+      const y = cy + localX * ny + localY * nx;
+      if (i === 0) g.moveTo(x, y);
+      else g.lineTo(x, y);
+    }
+    g.close();
   }
 
   dispose(): void {
@@ -667,6 +1158,8 @@ export class EditableMatch {
     this.curveTouchId = null;
     this.curveTouchStart = null;
     this.curveTouchPoint = null;
+    this.curveBaseOffset = 0;
+    this.curveCurrentOffset = 0;
     this.aimGraphics?.clear();
   }
 
@@ -1266,6 +1759,23 @@ function distSq(ax: number, ay: number, bx: number, by: number): number {
   return dx * dx + dy * dy;
 }
 
+function pathLength(path: Vec2[]): number {
+  let total = 0;
+  for (let i = 1; i < path.length; i += 1) {
+    const dx = path[i].x - path[i - 1].x;
+    const dy = path[i].y - path[i - 1].y;
+    total += Math.sqrt(dx * dx + dy * dy);
+  }
+  return total;
+}
+
+function formatClock(seconds: number): string {
+  const clamped = Math.max(0, Math.ceil(seconds));
+  const minutes = Math.floor(clamped / 60);
+  const rest = clamped % 60;
+  return `${minutes}:${rest < 10 ? '0' : ''}${rest}`;
+}
+
 function curvePointAtArcDistance(distance: number, arcDistance: number, angleRad: number): { x: number; y: number } {
   if (Math.abs(angleRad) < 0.001 || arcDistance <= 0) return { x: distance, y: 0 };
   const t = clamp(distance / arcDistance, 0, 1);
@@ -1275,4 +1785,9 @@ function curvePointAtArcDistance(distance: number, arcDistance: number, angleRad
     x: radius * (Math.sin(angleRad) - Math.sin(theta)),
     y: radius * (Math.cos(theta) - Math.cos(angleRad)),
   };
+}
+
+function localAimPoint(distance: number, arcDistance: number, angleRad: number): Vec2 {
+  const point = curvePointAtArcDistance(distance, arcDistance, angleRad);
+  return new Vec2(point.x, point.y);
 }
