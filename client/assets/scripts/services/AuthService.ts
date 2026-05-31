@@ -149,16 +149,20 @@ function randomHex(byteLength: number): string {
 }
 
 export function postAuth(path: string, body: Record<string, string>): Promise<AuthResponse> {
+  return postJson<AuthResponse>(path, body);
+}
+
+export function postJson<T>(path: string, body: unknown, timeoutMs = 8000): Promise<T> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `${AUTH_API_BASE_URL}${path}`, true);
     xhr.setRequestHeader('Content-Type', 'application/json');
-    xhr.timeout = 8000;
+    xhr.timeout = timeoutMs;
     xhr.onreadystatechange = () => {
       if (xhr.readyState !== 4) return;
-      let parsed: AuthResponse | null = null;
+      let parsed: T | null = null;
       try {
-        parsed = xhr.responseText ? JSON.parse(xhr.responseText) as AuthResponse : null;
+        parsed = xhr.responseText ? JSON.parse(xhr.responseText) as T : null;
       } catch {
         parsed = null;
       }
@@ -166,7 +170,8 @@ export function postAuth(path: string, body: Record<string, string>): Promise<Au
         resolve(parsed);
         return;
       }
-      reject(new Error(parsed?.message || `服务器请求失败：${xhr.status}`));
+      const message = parsed && typeof parsed === 'object' && 'message' in parsed ? String((parsed as { message?: unknown }).message || '') : '';
+      reject(new Error(message || `服务器请求失败：${xhr.status}`));
     };
     xhr.onerror = () => reject(new Error('无法连接服务器'));
     xhr.ontimeout = () => reject(new Error('连接服务器超时'));

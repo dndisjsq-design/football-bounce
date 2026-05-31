@@ -45,7 +45,11 @@ export function getFormationById(id: string): FormationDefinition | null {
 }
 
 export function getMatchFormationPoints(side: TeamSide, fieldWidth: number, fieldHeight: number): FormationPoint[] {
-  const formation = getSelectedFormation();
+  return getMatchFormationPointsById(getSelectedFormation().id, side, fieldWidth, fieldHeight);
+}
+
+export function getMatchFormationPointsById(id: string, side: TeamSide, fieldWidth: number, fieldHeight: number): FormationPoint[] {
+  const formation = getFormationById(id);
   const ySign = side === 'home' ? 1 : -1;
   return formation.points.map((point) => ({
     x: point.x * fieldWidth,

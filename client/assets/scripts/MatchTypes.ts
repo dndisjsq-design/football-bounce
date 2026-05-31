@@ -63,6 +63,9 @@ export interface MatchEvent {
   tick: number;
   side?: TeamSide;
   actorId?: string;
+  matchSecond?: number;
+  penalty?: boolean;
+  ownGoal?: boolean;
   score?: ScoreState;
   clientTick: number;
 }
