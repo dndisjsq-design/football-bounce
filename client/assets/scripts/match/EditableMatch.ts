@@ -739,7 +739,8 @@ export class EditableMatch {
   private updateClocks(dt: number): void {
     if (this.matchEnded || this.goalCelebrationRemaining > 0) return;
     if (!this.penaltyShootout) this.matchRemaining = Math.max(0, this.matchRemaining - dt);
-    this.turnRemaining = Math.max(0, this.turnRemaining - dt);
+    const shouldTickTurn = this.penaltyShootout || this.isSettled();
+    if (shouldTickTurn) this.turnRemaining = Math.max(0, this.turnRemaining - dt);
     if (!this.penaltyShootout && this.matchRemaining <= 0) {
       this.endMatchByScore();
       return;
