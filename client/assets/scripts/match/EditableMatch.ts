@@ -41,6 +41,13 @@ const MATCH_SECONDS = 180;
 const TURN_SECONDS = 15;
 const WIN_SCORE = 3;
 const GOAL_CELEBRATION_SECONDS = 3;
+const PENALTY_ATTACK_DELAY = 3;
+const PENALTY_SHOOTOUT_ROUNDS = 5;
+const PENALTY_KEEPER_MOVE = 42;
+const PENALTY_INTRO_SECONDS = 6;
+const PENALTY_OFFSCREEN = 9999;
+
+type CelebrationKind = 'goal' | 'matchEnd' | 'penaltyIntro';
 
 interface GoalRecord {
   side: TeamSide;
@@ -49,6 +56,11 @@ interface GoalRecord {
   timeText: string;
   elapsedSeconds: number;
   order: number;
+}
+
+interface PenaltyMark {
+  side: TeamSide;
+  made: boolean;
 }
 
 interface CurveMotion {
@@ -86,12 +98,29 @@ export class EditableMatch {
   private matchEnded = false;
   private goalCelebrationRemaining = 0;
   private goalCelebrationElapsed = 0;
+  private celebrationKind: CelebrationKind = 'goal';
   private goalScorer: TeamSide | null = null;
   private pendingKickoffTurn: TeamSide = 'home';
   private victorySide: TeamSide | null = null;
   private goalRecords: GoalRecord[] = [];
+  private penaltyGoalRecords: GoalRecord[] = [];
   private lastShotActorId = '';
   private goalOrder = 0;
+  private penaltyShootout = false;
+  private penaltySuddenDeath = false;
+  private penaltyShotIndex = 0;
+  private penaltyTurn: TeamSide = 'home';
+  private penaltyAttackerReady = false;
+  private penaltyAttackDelay = 0;
+  private penaltyShotTaken = false;
+  private penaltyKeeperMoved = false;
+  private penaltyKeeperPendingDirection: -1 | 0 | 1 = 0;
+  private penaltyKeeperSwipeStart: Vec2 | null = null;
+  private penaltyScore = { home: 0, away: 0 };
+  private penaltyMarks: PenaltyMark[] = [];
+  private currentPenaltyKickerId = '';
+  private currentPenaltyKeeperId = '';
+  private pendingPenaltyIntro = false;
 
   constructor(canvas: Node, mode: MatchMode, transport: MatchTransport) {
     this.canvas = canvas;
@@ -100,8 +129,9 @@ export class EditableMatch {
   }
 
   start(): void {
+    this.removeLegacyBottomScoreboard();
     const title = findNode(this.canvas, 'TextMode')?.getComponent(Label);
-    if (title) title.string = this.mode === 'ai' ? '单机人机' : '真人联机';
+    if (title) title.string = `${this.score.home} : ${this.score.away}`;
     this.transport.onRemoteShoot((command) => this.applyShoot(command));
     this.transport.onSnapshot((snapshot) => this.applySnapshot(snapshot));
     void this.transport.connect(MATCH_ID).catch(() => undefined);
@@ -115,6 +145,7 @@ export class EditableMatch {
   tick(dt: number): void {
     this.updateGoalCelebration(dt);
     this.updateClocks(dt);
+    this.updatePenaltyShootout(dt);
     this.step(dt);
     if (!this.matchEnded && this.goalCelebrationRemaining <= 0 && this.mode === 'ai' && this.turn === 'away' && this.isSettled()) {
       this.aiCooldown -= dt;
@@ -160,10 +191,14 @@ export class EditableMatch {
     const pitchTop = this.pitchTopY();
     this.createHudLabel(hud, 'HudHomeName', this.matchDisplayName(), -width / 2 + 76, pitchTop + 23, 14, rgba(255, 255, 255), Label.HorizontalAlign.LEFT);
     this.createHudLabel(hud, 'HudAwayName', this.mode === 'ai' ? '电脑' : '对手', width / 2 - 76, pitchTop + 23, 14, rgba(255, 255, 255), Label.HorizontalAlign.RIGHT);
+    this.createHudLabel(hud, 'HudModeName', this.mode === 'ai' ? '单机人机' : '真人联机', width / 2 - 40, pitchTop + 56, 13, rgba(255, 255, 255), Label.HorizontalAlign.RIGHT)
+      .node.getComponent(UITransform)?.setContentSize(92, 22);
     this.createHudLabel(hud, 'HudMatchTime', formatClock(this.matchRemaining), 0, pitchTop + 25, 22, rgba(255, 246, 178), Label.HorizontalAlign.CENTER)
       .node.getComponent(UITransform)?.setContentSize(82, 28);
     this.createHudLabel(hud, 'HudGoalLeft', '进', 240, 0, 64, rgba(255, 246, 220), Label.HorizontalAlign.CENTER).node.active = false;
     this.createHudLabel(hud, 'HudGoalRight', '球', 300, 0, 64, rgba(255, 246, 220), Label.HorizontalAlign.CENTER).node.active = false;
+    this.createHudLabel(hud, 'HudPenaltyIntro', '', 0, 36, 24, rgba(255, 246, 220), Label.HorizontalAlign.CENTER).node.active = false;
+    this.createHudLabel(hud, 'HudPenaltyCount', '', 0, -8, 92, rgba(255, 246, 178), Label.HorizontalAlign.CENTER).node.active = false;
     this.createHudLabel(hud, 'HudVictoryTitle', '', 0, 42, 34, rgba(255, 246, 178), Label.HorizontalAlign.CENTER).node.active = false;
     this.createHudLabel(hud, 'HudVictoryScore', '', 0, -4, 24, rgba(255, 255, 255), Label.HorizontalAlign.CENTER).node.active = false;
     this.hudGraphics = hud.getComponent(Graphics) || hud.addComponent(Graphics);
@@ -246,8 +281,10 @@ export class EditableMatch {
           this.updateDragTouches(event);
           return;
         }
+        this.beginPenaltyKeeperSwipe(event);
         const current = this.players.find((p) => p.id === playerId);
         if (this.matchEnded || this.goalCelebrationRemaining > 0 || !current || current.side !== 'home' || this.turn !== 'home' || !this.isSettled()) return;
+        if (this.penaltyShootout && (!this.penaltyAttackerReady || current.id !== this.currentPenaltyKickerId)) return;
         this.dragActor = current;
         this.dragStart = new Vec2(current.x, current.y);
         this.powerTouchId = event.touch?.getID() ?? null;
@@ -265,8 +302,14 @@ export class EditableMatch {
       node.on(Node.EventType.TOUCH_CANCEL, (event: EventTouch) => this.handleDragTouchEnd(event));
     }
     const pitch = this.pitchNode;
-    pitch?.on(Node.EventType.TOUCH_START, (event: EventTouch) => this.updateDragTouches(event));
-    pitch?.on(Node.EventType.TOUCH_MOVE, (event: EventTouch) => this.updateDragTouches(event));
+    pitch?.on(Node.EventType.TOUCH_START, (event: EventTouch) => {
+      this.beginPenaltyKeeperSwipe(event);
+      this.updateDragTouches(event);
+    });
+    pitch?.on(Node.EventType.TOUCH_MOVE, (event: EventTouch) => {
+      this.handlePenaltyKeeperSwipe(event);
+      this.updateDragTouches(event);
+    });
     pitch?.on(Node.EventType.TOUCH_END, (event: EventTouch) => this.handleDragTouchEnd(event));
     pitch?.on(Node.EventType.TOUCH_CANCEL, (event: EventTouch) => this.handleDragTouchEnd(event));
   }
@@ -296,6 +339,30 @@ export class EditableMatch {
     }
     this.curveTouchPoint = curvePoint;
     this.updateCurveOffsetFromTouch();
+  }
+
+  private handlePenaltyKeeperSwipe(event: EventTouch): void {
+    if (!this.penaltyShootout || this.penaltyKeeperMoved || this.matchEnded || this.goalCelebrationRemaining > 0) return;
+    const defendingSide = this.penaltyTurn === 'home' ? 'away' : 'home';
+    if (defendingSide !== 'home') return;
+    const touch = event.getTouches()[0] || event.touch;
+    if (!touch) return;
+    const point = this.touchToPitchPoint(touch);
+    if (!this.penaltyKeeperSwipeStart) {
+      this.penaltyKeeperSwipeStart = point;
+      return;
+    }
+    const dx = point.x - this.penaltyKeeperSwipeStart.x;
+    if (Math.abs(dx) < 18) return;
+    this.penaltyKeeperPendingDirection = dx > 0 ? 1 : -1;
+  }
+
+  private beginPenaltyKeeperSwipe(event: EventTouch): void {
+    if (!this.penaltyShootout || this.penaltyKeeperMoved || this.matchEnded || this.goalCelebrationRemaining > 0) return;
+    const defendingSide = this.penaltyTurn === 'home' ? 'away' : 'home';
+    if (defendingSide !== 'home') return;
+    const touch = event.getTouches()[0] || event.touch;
+    if (touch) this.penaltyKeeperSwipeStart = this.touchToPitchPoint(touch);
   }
 
   private handleDragTouchEnd(event: EventTouch): void {
@@ -355,6 +422,7 @@ export class EditableMatch {
     if (this.appliedCommandIds.has(command.commandId)) return;
     const actor = this.players.find((p) => p.id === command.actorId);
     if (!actor || actor.side !== command.side || command.side !== this.turn || !this.isSettled()) return;
+    if (this.penaltyShootout && (!this.penaltyAttackerReady || actor.id !== this.currentPenaltyKickerId)) return;
     this.appliedCommandIds.add(command.commandId);
     const curveAngle = clamp(command.curveAngleRad || 0, -MAX_CURVE_ANGLE, MAX_CURVE_ANGLE);
     const curveDistance = Math.max(0, command.curveDistance || 0);
@@ -364,6 +432,10 @@ export class EditableMatch {
     actor.vx = Math.cos(shotAngle) * speed;
     actor.vy = Math.sin(shotAngle) * speed;
     this.lastShotActorId = actor.id;
+    if (this.penaltyShootout) {
+      this.penaltyShotTaken = true;
+      this.applyPenaltyKeeperMove();
+    }
     if (hasCurve) {
       this.activeCurves.set(actor.id, {
         remainingAngle: -curveAngle * 2,
@@ -372,12 +444,18 @@ export class EditableMatch {
     } else {
       this.activeCurves.delete(actor.id);
     }
-    this.turn = this.turn === 'home' ? 'away' : 'home';
-    this.turnRemaining = TURN_SECONDS;
+    if (!this.penaltyShootout) {
+      this.turn = this.turn === 'home' ? 'away' : 'home';
+      this.turnRemaining = TURN_SECONDS;
+    }
     this.emitMatchEvent({ type: 'shoot', side: command.side, actorId: actor.id });
   }
 
   private fireAi(): void {
+    if (this.penaltyShootout) {
+      this.firePenaltyAi();
+      return;
+    }
     const candidates = this.players.filter((p) => p.side === 'away');
     let best = candidates[0];
     for (const p of candidates) {
@@ -390,6 +468,25 @@ export class EditableMatch {
       side: 'away',
       angleRad: Math.atan2(this.ball.y - best.y, this.ball.x - best.x),
       power: 0.68,
+      curveAngleRad: 0,
+      curveDistance: 0,
+      clientTick: Date.now(),
+    });
+  }
+
+  private firePenaltyAi(): void {
+    if (!this.penaltyAttackerReady || this.penaltyTurn !== 'away' || this.penaltyShotTaken) return;
+    const actor = this.players.find((p) => p.id === this.currentPenaltyKickerId);
+    if (!actor) return;
+    const targetX = (Math.random() - 0.5) * GOAL_HALF_WIDTH * 1.45;
+    const targetY = this.goalLineY + 8;
+    this.submitShoot({
+      commandId: nextId('ai-penalty'),
+      matchId: MATCH_ID,
+      actorId: actor.id,
+      side: 'away',
+      angleRad: Math.atan2(targetY - actor.y, targetX - actor.x),
+      power: 0.72 + Math.random() * 0.18,
       curveAngleRad: 0,
       curveDistance: 0,
       clientTick: Date.now(),
@@ -598,22 +695,26 @@ export class EditableMatch {
   private checkGoal(): void {
     if (this.goalCelebrationRemaining > 0 || this.matchEnded) return;
     if (Math.abs(this.ball.x) > GOAL_HALF_WIDTH - this.ball.radius) return;
+    if (this.penaltyShootout) {
+      if (this.ball.y > this.goalLineY + this.ball.radius) this.registerPenaltyGoal(this.penaltyTurn);
+      return;
+    }
     if (this.ball.y > this.goalLineY + this.ball.radius) this.registerGoal('home');
     if (this.ball.y < -this.goalLineY - this.ball.radius) this.registerGoal('away');
   }
 
   private registerGoal(side: TeamSide): void {
     this.score[side] += 1;
+    this.stopBallInGoal();
     this.recordGoal(side);
     this.emitMatchEvent({ type: 'goal', side });
     this.goalScorer = side;
     this.pendingKickoffTurn = side === 'home' ? 'away' : 'home';
     this.goalCelebrationRemaining = GOAL_CELEBRATION_SECONDS;
     this.goalCelebrationElapsed = 0;
+    this.celebrationKind = this.score[side] >= WIN_SCORE ? 'matchEnd' : 'goal';
     this.clearDragAim();
-    if (this.score[side] >= WIN_SCORE) {
-      this.victorySide = side;
-    }
+    if (this.score[side] >= WIN_SCORE) this.victorySide = side;
   }
 
   private syncNodes(): void {
@@ -622,9 +723,13 @@ export class EditableMatch {
       ballNode.setPosition(this.ball.x, this.ball.y);
       ballNode.angle = this.ballSpinDeg;
     }
-    for (const p of this.players) findNode(this.canvas, `Player_${p.id}`)?.setPosition(p.x, p.y);
-    const scoreLabel = findNode(this.canvas, 'TextScore')?.getComponent(Label);
-    if (scoreLabel) scoreLabel.string = `${this.score.away} : ${this.score.home}`;
+    for (const p of this.players) {
+      const node = findNode(this.canvas, `Player_${p.id}`);
+      if (!node) continue;
+      node.active = true;
+      node.setPosition(p.x, p.y);
+    }
+    this.syncLegacyScoreLabels();
     const turnLabel = findNode(this.canvas, 'TextTurn')?.getComponent(Label);
     if (turnLabel) turnLabel.string = '';
     this.drawMatchHud();
@@ -633,14 +738,20 @@ export class EditableMatch {
 
   private updateClocks(dt: number): void {
     if (this.matchEnded || this.goalCelebrationRemaining > 0) return;
-    this.matchRemaining = Math.max(0, this.matchRemaining - dt);
+    if (!this.penaltyShootout) this.matchRemaining = Math.max(0, this.matchRemaining - dt);
     this.turnRemaining = Math.max(0, this.turnRemaining - dt);
-    if (this.matchRemaining <= 0) {
+    if (!this.penaltyShootout && this.matchRemaining <= 0) {
       this.endMatchByScore();
       return;
     }
     if (this.turnRemaining <= 0) {
       this.clearDragAim();
+      if (this.penaltyShootout) {
+        this.penaltyMarks.push({ side: this.penaltyTurn, made: false });
+        this.penaltyShotTaken = false;
+        this.advancePenaltyKick();
+        return;
+      }
       this.turn = this.turn === 'home' ? 'away' : 'home';
       this.turnRemaining = TURN_SECONDS;
       this.aiCooldown = 0.8;
@@ -660,8 +771,10 @@ export class EditableMatch {
     this.drawHudPlayer(g, homeX, topY, 'home', this.turn === 'home' ? this.turnRemaining / TURN_SECONDS : 1, this.turn === 'home' && !this.matchEnded);
     this.drawHudPlayer(g, awayX, topY, 'away', this.turn === 'away' ? this.turnRemaining / TURN_SECONDS : 1, this.turn === 'away' && !this.matchEnded);
     const matchLabel = findNode(hud, 'HudMatchTime')?.getComponent(Label);
-    if (matchLabel) matchLabel.string = formatClock(this.matchRemaining);
+    if (matchLabel) matchLabel.string = this.penaltyShootout ? '' : formatClock(this.matchRemaining);
+    this.drawPenaltyScoreboard(g);
     this.drawGoalCelebration(g);
+    this.drawPenaltyKickCountdown(g);
     this.drawVictoryOverlay(g);
     this.drawVictorySettlement(g);
   }
@@ -677,9 +790,18 @@ export class EditableMatch {
     this.goalCelebrationElapsed += dt;
     if (this.goalCelebrationRemaining > 0) return;
     this.hideGoalLabels();
+    if (this.celebrationKind === 'penaltyIntro') {
+      this.hidePenaltyIntroLabels();
+      this.enterPenaltyShootout();
+      return;
+    }
     if (this.victorySide) {
       this.matchEnded = true;
       this.turnRemaining = 0;
+      return;
+    }
+    if (this.penaltyShootout) {
+      this.advancePenaltyKick();
       return;
     }
     this.resetObjects(this.pendingKickoffTurn);
@@ -697,13 +819,33 @@ export class EditableMatch {
     const width = this.canvas.getComponent(UITransform)?.contentSize.width || 390;
     const height = this.canvas.getComponent(UITransform)?.contentSize.height || 844;
     const t = clamp(this.goalCelebrationElapsed / GOAL_CELEBRATION_SECONDS, 0, 1);
+    if (this.celebrationKind === 'penaltyIntro') {
+      this.drawPenaltyIntro(g, width, height);
+      return;
+    }
     const slide = easeOutCubic(clamp(t / 0.26, 0, 1));
     const holdY = 6;
     leftLabel.active = true;
     rightLabel.active = true;
+    if (this.celebrationKind === 'matchEnd') {
+      const left = leftLabel.getComponent(Label);
+      const right = rightLabel.getComponent(Label);
+      if (left) left.string = '比赛';
+      if (right) right.string = '结束';
+      leftLabel.getComponent(UITransform)?.setContentSize(120, 72);
+      rightLabel.getComponent(UITransform)?.setContentSize(120, 72);
+    } else {
+      const left = leftLabel.getComponent(Label);
+      const right = rightLabel.getComponent(Label);
+      if (left) left.string = '进';
+      if (right) right.string = '球';
+      leftLabel.getComponent(UITransform)?.setContentSize(118, 24);
+      rightLabel.getComponent(UITransform)?.setContentSize(118, 24);
+    }
     const textX = width / 2 + 70 - (width / 2 + 70) * slide;
-    leftLabel.setPosition(textX - 34, holdY);
-    rightLabel.setPosition(textX + 34, holdY);
+    const textGap = this.celebrationKind === 'matchEnd' ? 58 : 34;
+    leftLabel.setPosition(textX - textGap, holdY);
+    rightLabel.setPosition(textX + textGap, holdY);
 
     g.fillColor = rgba(0, 0, 0, 132);
     g.rect(-width / 2, -height / 2, width, height);
@@ -736,6 +878,86 @@ export class EditableMatch {
     }
   }
 
+  private drawPenaltyIntro(g: Graphics, width: number, height: number): void {
+    const intro = findNode(this.ensureHudNode(), 'HudPenaltyIntro');
+    const count = findNode(this.ensureHudNode(), 'HudPenaltyCount');
+    const elapsed = this.goalCelebrationElapsed;
+    g.fillColor = rgba(0, 0, 0, 166);
+    g.rect(-width / 2, -height / 2, width, height);
+    g.fill();
+    if (intro) {
+      intro.active = true;
+      intro.setPosition(0, 72);
+      intro.getComponent(UITransform)?.setContentSize(260, 38);
+      const label = intro.getComponent(Label);
+      if (label) {
+        label.string = '即将进入点球大战';
+        label.fontSize = 24;
+        label.color = rgba(255, 246, 220);
+      }
+    }
+    if (!count) return;
+    count.active = elapsed >= 1;
+    const label = count.getComponent(Label);
+    if (!label || elapsed < 1) return;
+    const countdownElapsed = clamp(elapsed - 1, 0, 5);
+    const number = Math.max(1, 5 - Math.floor(countdownElapsed));
+    const phase = countdownElapsed % 1;
+    const scale = 1.35 - 0.35 * easeOutCubic(phase);
+    count.setScale(scale, scale, 1);
+    count.setPosition(0, -4);
+    count.getComponent(UITransform)?.setContentSize(150, 120);
+    label.string = `${number}`;
+    label.fontSize = 92;
+    label.isBold = true;
+    label.color = rgba(255, 246, 178);
+    g.fillColor = rgba(42, 32, 8, 155);
+    g.roundRect(-46 * scale + 6, -56 * scale - 5, 92 * scale, 112 * scale, 10);
+    g.fill();
+  }
+
+  private drawPenaltyKickCountdown(g: Graphics): void {
+    if (!this.penaltyShootout || this.matchEnded || this.goalCelebrationRemaining > 0 || this.penaltyAttackDelay <= 0 || this.penaltyTurn !== 'home') {
+      if (this.penaltyShootout && this.goalCelebrationRemaining <= 0) this.hidePenaltyIntroLabels();
+      return;
+    }
+    const width = this.canvas.getComponent(UITransform)?.contentSize.width || 390;
+    const height = this.canvas.getComponent(UITransform)?.contentSize.height || 844;
+    const intro = findNode(this.ensureHudNode(), 'HudPenaltyIntro');
+    const count = findNode(this.ensureHudNode(), 'HudPenaltyCount');
+    g.fillColor = rgba(0, 0, 0, 132);
+    g.rect(-width / 2, -height / 2, width, height);
+    g.fill();
+    if (intro) {
+      intro.active = true;
+      intro.setPosition(0, 72);
+      intro.getComponent(UITransform)?.setContentSize(240, 38);
+      const label = intro.getComponent(Label);
+      if (label) {
+        label.string = '距离罚点还有';
+        label.fontSize = 24;
+        label.color = rgba(255, 246, 220);
+      }
+    }
+    if (!count) return;
+    const number = Math.max(1, Math.ceil(this.penaltyAttackDelay));
+    const phase = 1 - (this.penaltyAttackDelay % 1 || 1);
+    const scale = 1.35 - 0.35 * easeOutCubic(phase);
+    count.active = true;
+    count.setScale(scale, scale, 1);
+    count.setPosition(0, -4);
+    count.getComponent(UITransform)?.setContentSize(150, 120);
+    const label = count.getComponent(Label);
+    if (!label) return;
+    label.string = `${number}`;
+    label.fontSize = 92;
+    label.isBold = true;
+    label.color = rgba(255, 246, 178);
+    g.fillColor = rgba(42, 32, 8, 155);
+    g.roundRect(-46 * scale + 6, -56 * scale - 5, 92 * scale, 112 * scale, 10);
+    g.fill();
+  }
+
   private drawVictorySettlement(g: Graphics): void {
     const titleNode = findNode(this.ensureHudNode(), 'HudVictoryTitle');
     const scoreNode = findNode(this.ensureHudNode(), 'HudVictoryScore');
@@ -765,7 +987,7 @@ export class EditableMatch {
     const title = titleNode.getComponent(Label);
     const score = scoreNode.getComponent(Label);
     if (title) title.string = isWin ? '胜利' : '失败';
-    if (score) score.string = `${this.score.away} : ${this.score.home}`;
+    if (score) score.string = this.finalScoreText();
     this.drawVictoryTimeline(g);
     this.ensureVictoryDetails();
   }
@@ -779,12 +1001,92 @@ export class EditableMatch {
     g.fill();
   }
 
+  private drawPenaltyScoreboard(g: Graphics): void {
+    if (!this.penaltyShootout) return;
+    const rowW = 112;
+    const rowH = 24;
+    const x = -rowW / 2;
+    const topY = this.pitchTopY() + 48;
+    this.drawPenaltyScoreRow(g, x, topY, 'home', rowW, rowH);
+    this.drawPenaltyScoreRow(g, x, topY - rowH - 3, 'away', rowW, rowH);
+  }
+
+  private syncLegacyScoreLabels(): void {
+    this.removeLegacyBottomScoreboard();
+    this.setLegacyScoreLabel('TextMode', true, `${this.score.home} : ${this.score.away}`);
+  }
+
+  private setLegacyScoreLabel(name: string, visible: boolean, value: string): void {
+    const node = findNode(this.canvas, name);
+    const label = node?.getComponent(Label);
+    if (!node || !label) return;
+    node.active = visible;
+    label.enabled = visible;
+    label.string = visible ? value : '';
+    label.color = visible ? rgba(245, 249, 255) : rgba(245, 249, 255, 0);
+    if (visible) node.setPosition(0, name === 'TextMode' ? 386 : 356);
+    else node.setPosition(0, -9999);
+  }
+
+  private removeLegacyBottomScoreboard(): void {
+    const node = findNode(this.canvas, 'TextScore');
+    if (!node) return;
+    node.active = false;
+    const label = node.getComponent(Label);
+    if (label) {
+      label.enabled = false;
+      label.string = '';
+      label.color = rgba(245, 249, 255, 0);
+    }
+    node.setPosition(0, -9999);
+    node.destroy();
+  }
+
+  private drawPenaltyScoreRow(g: Graphics, x: number, y: number, side: TeamSide, width: number, height: number): void {
+    g.fillColor = rgba(14, 43, 88, 232);
+    g.roundRect(x, y - height / 2, width, height, 4);
+    g.fill();
+    g.strokeColor = side === 'home' ? rgba(255, 80, 80, 235) : rgba(80, 150, 255, 235);
+    g.lineWidth = 2;
+    g.roundRect(x, y - height / 2, width, height, 4);
+    g.stroke();
+    drawGenericMatchAvatar(g, x + 15, y, 7.5, side);
+    const marks = this.penaltyMarks.filter((mark) => mark.side === side);
+    for (let i = 0; i < PENALTY_SHOOTOUT_ROUNDS; i += 1) {
+      const mark = marks[i];
+      g.fillColor = mark ? (mark.made ? rgba(65, 212, 96, 245) : rgba(236, 66, 72, 245)) : rgba(7, 22, 48, 245);
+      g.circle(x + 31 + i * 16, y, 5.5);
+      g.fill();
+      g.strokeColor = rgba(255, 255, 255, 190);
+      g.lineWidth = 1;
+      g.circle(x + 31 + i * 16, y, 5.5);
+      g.stroke();
+    }
+  }
+
+  private finalScoreText(): string {
+    if (!this.penaltyShootout) return `${this.score.home} : ${this.score.away}`;
+    return `${this.score.home + this.penaltyScore.home}（${this.penaltyScore.home}）：${this.score.away + this.penaltyScore.away}（${this.penaltyScore.away}）`;
+  }
+
   private hideGoalLabels(): void {
     const hud = this.ensureHudNode();
     const leftLabel = findNode(hud, 'HudGoalLeft');
     const rightLabel = findNode(hud, 'HudGoalRight');
     if (leftLabel) leftLabel.active = false;
     if (rightLabel) rightLabel.active = false;
+    this.hidePenaltyIntroLabels();
+  }
+
+  private hidePenaltyIntroLabels(): void {
+    const hud = this.ensureHudNode();
+    const intro = findNode(hud, 'HudPenaltyIntro');
+    const count = findNode(hud, 'HudPenaltyCount');
+    if (intro) intro.active = false;
+    if (count) {
+      count.active = false;
+      count.setScale(1, 1, 1);
+    }
   }
 
   private recordGoal(side: TeamSide): void {
@@ -803,12 +1105,203 @@ export class EditableMatch {
   private endMatchByScore(): void {
     this.clearDragAim();
     if (this.score.home === this.score.away) {
-      this.matchEnded = true;
-      this.victorySide = this.score.home >= this.score.away ? 'home' : 'away';
+      this.startPenaltyIntro();
       return;
     }
     this.victorySide = this.score.home > this.score.away ? 'home' : 'away';
-    this.matchEnded = true;
+    this.celebrationKind = 'matchEnd';
+    this.goalCelebrationRemaining = GOAL_CELEBRATION_SECONDS;
+    this.goalCelebrationElapsed = 0;
+  }
+
+  private startPenaltyIntro(): void {
+    this.celebrationKind = 'penaltyIntro';
+    this.goalCelebrationRemaining = PENALTY_INTRO_SECONDS;
+    this.goalCelebrationElapsed = 0;
+    this.pendingPenaltyIntro = true;
+  }
+
+  private enterPenaltyShootout(): void {
+    this.penaltyShootout = true;
+    this.pendingPenaltyIntro = false;
+    this.penaltySuddenDeath = false;
+    this.penaltyShotIndex = 0;
+    this.penaltyTurn = 'home';
+    this.penaltyScore = { home: 0, away: 0 };
+    this.penaltyMarks = [];
+    this.setupPenaltyKick('home');
+  }
+
+  private setupPenaltyKick(attackingSide: TeamSide): void {
+    this.clearDragAim();
+    this.penaltyTurn = attackingSide;
+    this.turn = attackingSide;
+    this.turnRemaining = TURN_SECONDS;
+    this.aiCooldown = 0.25;
+    this.penaltyAttackDelay = PENALTY_ATTACK_DELAY;
+    this.penaltyAttackerReady = false;
+    this.penaltyShotTaken = false;
+    this.penaltyKeeperMoved = false;
+    this.penaltyKeeperPendingDirection = 0;
+    this.penaltyKeeperSwipeStart = null;
+    this.activeCurves.clear();
+    const ballPosition = this.penaltyBallPosition();
+    const attackerPosition = this.penaltyAttackerPosition();
+    const keeperPosition = this.penaltyKeeperPosition();
+    const offscreenPosition = this.penaltyOffscreenPosition();
+    this.ball = makeBall(ballPosition.x, ballPosition.y);
+    this.ballSpinDeg = 0;
+    const defendingSide = attackingSide === 'home' ? 'away' : 'home';
+    this.currentPenaltyKickerId = this.nextPenaltyKickerId(attackingSide);
+    this.currentPenaltyKeeperId = this.penaltyKeeperId(defendingSide);
+    for (const player of this.players) {
+      player.vx = 0;
+      player.vy = 0;
+      if (player.id === this.currentPenaltyKickerId) {
+        player.x = attackerPosition.x;
+        player.y = attackerPosition.y;
+      } else if (player.id === this.currentPenaltyKeeperId) {
+        player.x = keeperPosition.x;
+        player.y = keeperPosition.y;
+      } else {
+        player.x = offscreenPosition.x;
+        player.y = offscreenPosition.y;
+      }
+    }
+    this.resolveAllCollisions();
+    this.refreshPenaltyPlayerVisibility();
+  }
+
+  private updatePenaltyShootout(dt: number): void {
+    if (!this.penaltyShootout || this.matchEnded || this.goalCelebrationRemaining > 0) return;
+    if (this.penaltyAttackDelay > 0) {
+      this.penaltyAttackDelay = Math.max(0, this.penaltyAttackDelay - dt);
+      if (this.penaltyAttackDelay <= 0) this.penaltyAttackerReady = true;
+    }
+    if (this.penaltyTurn === 'home' && !this.penaltyKeeperMoved && this.penaltyKeeperPendingDirection === 0 && this.penaltyAttackDelay < 0.5 && Math.random() < 0.025) {
+      this.penaltyKeeperPendingDirection = Math.random() > 0.5 ? 1 : -1;
+    }
+    if (this.penaltyShotTaken && this.isSettled()) this.registerPenaltyMiss();
+  }
+
+  private registerPenaltyGoal(side: TeamSide): void {
+    if (!this.penaltyShootout || side !== this.penaltyTurn) return;
+    this.penaltyScore[side] += 1;
+    this.stopBallInGoal();
+    this.penaltyMarks.push({ side, made: true });
+    this.recordPenaltyGoal(side);
+    this.goalScorer = side;
+    this.goalCelebrationRemaining = GOAL_CELEBRATION_SECONDS;
+    this.goalCelebrationElapsed = 0;
+    this.celebrationKind = 'goal';
+    this.clearDragAim();
+    this.penaltyShotTaken = false;
+    this.emitMatchEvent({ type: 'goal', side });
+  }
+
+  private registerPenaltyMiss(): void {
+    if (!this.penaltyShootout || !this.penaltyShotTaken || this.goalCelebrationRemaining > 0) return;
+    this.penaltyMarks.push({ side: this.penaltyTurn, made: false });
+    this.penaltyShotTaken = false;
+    this.advancePenaltyKick();
+  }
+
+  private advancePenaltyKick(): void {
+    if (!this.penaltyShootout) return;
+    this.penaltyShotIndex += 1;
+    if (this.shouldEndPenaltyShootout()) {
+      this.victorySide = this.penaltyScore.home > this.penaltyScore.away ? 'home' : 'away';
+      this.celebrationKind = 'matchEnd';
+      this.goalCelebrationRemaining = GOAL_CELEBRATION_SECONDS;
+      this.goalCelebrationElapsed = 0;
+      this.turnRemaining = 0;
+      return;
+    }
+    if (!this.penaltySuddenDeath && this.penaltyShotIndex >= PENALTY_SHOOTOUT_ROUNDS * 2) {
+      this.penaltySuddenDeath = true;
+      this.penaltyShotIndex = 0;
+      this.penaltyMarks = [];
+    }
+    this.setupPenaltyKick(this.penaltyShotIndex % 2 === 0 ? 'home' : 'away');
+  }
+
+  private shouldEndPenaltyShootout(): boolean {
+    if (!this.penaltySuddenDeath) {
+      const homeTaken = Math.ceil(this.penaltyShotIndex / 2);
+      const awayTaken = Math.floor(this.penaltyShotIndex / 2);
+      const homeLeft = PENALTY_SHOOTOUT_ROUNDS - homeTaken;
+      const awayLeft = PENALTY_SHOOTOUT_ROUNDS - awayTaken;
+      if (this.penaltyScore.home > this.penaltyScore.away + awayLeft) return true;
+      if (this.penaltyScore.away > this.penaltyScore.home + homeLeft) return true;
+      return this.penaltyShotIndex >= PENALTY_SHOOTOUT_ROUNDS * 2 && this.penaltyScore.home !== this.penaltyScore.away;
+    }
+    return this.penaltyShotIndex > 0 && this.penaltyShotIndex % 2 === 0 && this.penaltyScore.home !== this.penaltyScore.away;
+  }
+
+  private nextPenaltyKickerId(side: TeamSide): string {
+    const takenBySide = this.penaltyMarks.filter((mark) => mark.side === side).length;
+    const round = this.penaltySuddenDeath ? takenBySide : takenBySide % PENALTY_SHOOTOUT_ROUNDS;
+    return `${side}-${round % 5 + 1}`;
+  }
+
+  private penaltyBallPosition(): Vec2 {
+    return new Vec2(0, this.goalLineY - 118);
+  }
+
+  private penaltyAttackerPosition(): Vec2 {
+    return new Vec2(0, this.penaltyBallPosition().y - 56);
+  }
+
+  private penaltyKeeperPosition(): Vec2 {
+    return new Vec2(0, this.goalLineY - 12);
+  }
+
+  private penaltyOffscreenPosition(): Vec2 {
+    return new Vec2(PENALTY_OFFSCREEN, PENALTY_OFFSCREEN);
+  }
+
+  private refreshPenaltyPlayerVisibility(): void {
+    for (const player of this.players) {
+      const node = findNode(this.canvas, `Player_${player.id}`);
+      if (node) node.active = true;
+    }
+  }
+
+  private penaltyKeeperId(side: TeamSide): string {
+    return `${side}-1`;
+  }
+
+  private movePenaltyKeeper(side: TeamSide, direction: -1 | 1): void {
+    const keeper = this.players.find((p) => p.id === this.penaltyKeeperId(side));
+    if (!keeper) return;
+    keeper.x = clamp(keeper.x + direction * PENALTY_KEEPER_MOVE, -GOAL_HALF_WIDTH + keeper.radius, GOAL_HALF_WIDTH - keeper.radius);
+  }
+
+  private applyPenaltyKeeperMove(): void {
+    if (this.penaltyKeeperMoved || this.penaltyKeeperPendingDirection === 0) return;
+    const keeper = this.players.find((p) => p.id === this.currentPenaltyKeeperId);
+    if (!keeper) return;
+    keeper.x = clamp(keeper.x + this.penaltyKeeperPendingDirection * PENALTY_KEEPER_MOVE, -GOAL_HALF_WIDTH + keeper.radius, GOAL_HALF_WIDTH - keeper.radius);
+    this.penaltyKeeperMoved = true;
+  }
+
+  private stopBallInGoal(): void {
+    this.ball.vx = 0;
+    this.ball.vy = 0;
+    this.activeCurves.delete(this.ball.id);
+  }
+
+  private recordPenaltyGoal(side: TeamSide): void {
+    const actorId = this.currentPenaltyKickerId || `${side}-1`;
+    this.penaltyGoalRecords.push({
+      side,
+      actorId,
+      playerName: this.matchPlayerName(actorId, side),
+      timeText: '点球',
+      elapsedSeconds: MATCH_SECONDS,
+      order: this.goalOrder,
+    });
+    this.goalOrder += 1;
   }
 
   private matchPlayerName(actorId: string, side: TeamSide): string {
@@ -819,7 +1312,7 @@ export class EditableMatch {
 
   private bestPlayer(): { name: string; goals: number; side: TeamSide; actorId: string } | null {
     if (!this.victorySide) return null;
-    const records = this.goalRecords.filter((record) => record.side === this.victorySide);
+    const records = [...this.goalRecords, ...this.penaltyGoalRecords].filter((record) => record.side === this.victorySide);
     if (records.length === 0) return null;
     const counts = new Map<string, { name: string; goals: number; firstOrder: number; actorId: string }>();
     for (const record of records) {
@@ -860,7 +1353,7 @@ export class EditableMatch {
     }
     this.createHudLabel(hud, 'VictoryTimelineStart', '0:00', 0, this.timelineTopY() + 18, 12, rgba(255, 255, 255), Label.HorizontalAlign.CENTER)
       .node.getComponent(UITransform)?.setContentSize(60, 18);
-    this.createHudLabel(hud, 'VictoryTimelineEnd', '3:00', 0, this.timelineBottomY() - 18, 12, rgba(255, 255, 255), Label.HorizontalAlign.CENTER)
+    this.createHudLabel(hud, 'VictoryTimelineEnd', formatClock(MATCH_SECONDS), 0, this.timelineBottomY() - 18, 12, rgba(255, 255, 255), Label.HorizontalAlign.CENTER)
       .node.getComponent(UITransform)?.setContentSize(60, 18);
   }
 
@@ -1730,6 +2223,10 @@ export class EditableMatch {
   }
 
   private get bodies(): DiscBodyState[] {
+    if (this.penaltyShootout) {
+      const activeIds = new Set([this.currentPenaltyKickerId, this.currentPenaltyKeeperId]);
+      return [...this.players.filter((player) => activeIds.has(player.id)), this.ball];
+    }
     return [...this.players, this.ball];
   }
 
