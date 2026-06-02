@@ -1,6 +1,7 @@
 import { Color, EventTouch, Graphics, Label, Mask, MaskType, Node, Sprite, UITransform, director } from 'cc';
 import { FormationDefinition, getPreviewFormationPoints, getShopFormations } from '../services/FormationService';
-import { PlayerRarity, RosterPlayer, getPlayersByRarity } from '../services/PlayerRosterService';
+import { PlayerRarity, RosterPlayer } from '../services/PlayerRosterService';
+import { fetchShopPlayers } from '../services/ShopCatalogApiService';
 import { getCurrentCoins } from '../services/WalletService';
 import { drawPlayerAvatar, renderPricedPlayerCard } from '../ui/PlayerCardView';
 import { findNode, onTap, rgba } from '../utils/CocosNodeUtils';
@@ -60,8 +61,18 @@ export function bindShopPlayerScene(root: Node, rarities: PlayerRarity[]): void 
   bindTabs(root, 'shop');
   bindShopCurrency(root);
   onTap(root, 'ButtonBackShop', () => director.loadScene('Shop'));
-  const controller = new ShopPlayerList(root, getPlayersByRarity(rarities));
-  controller.start();
+  setListStatus(root, '加载球员列表...');
+  void fetchShopPlayers().then((players) => {
+    setListStatus(root, '');
+    const allowed = new Set<PlayerRarity>(rarities);
+    const filtered = players
+      .filter((player) => allowed.has(player.rarity))
+      .sort((a, b) => rarityRank(a.rarity) - rarityRank(b.rarity) || b.score - a.score);
+    const controller = new ShopPlayerList(root, filtered);
+    controller.start();
+  }).catch((error: Error) => {
+    setListStatus(root, error.message || '球员列表加载失败');
+  });
 }
 
 export function bindShopFormationScene(root: Node): void {
@@ -231,6 +242,17 @@ function bindShopCurrency(root: Node): void {
 function setLabelText(root: Node, nodeName: string, text: string): void {
   const label = findNode(root, nodeName)?.getComponent(Label);
   if (label) label.string = text;
+}
+
+function setListStatus(root: Node, text: string): void {
+  setLabelText(root, 'TextShopCoins', text || `金币 ${getCurrentCoins()}`);
+}
+
+function rarityRank(rarity: PlayerRarity): number {
+  if (rarity === 'red') return 0;
+  if (rarity === 'orange') return 1;
+  if (rarity === 'purple') return 2;
+  return 3;
 }
 
 function drawShopButton(root: Node, name: string, top: Color, bottom: Color): void {
