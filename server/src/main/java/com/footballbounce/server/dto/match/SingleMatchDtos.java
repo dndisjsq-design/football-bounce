@@ -7,7 +7,7 @@ public final class SingleMatchDtos {
     private SingleMatchDtos() {
     }
 
-    public record StartRequest(Long userId, Double fieldWidth, Double fieldHeight) {
+    public record StartRequest(Long userId, String clientSessionId, Double fieldWidth, Double fieldHeight) {
     }
 
     public record PlayerSummary(
@@ -167,5 +167,11 @@ public final class SingleMatchDtos {
     }
 
     public record FinishResponse(boolean ok, String message, SettlementDto settlement) {
+    }
+
+    public record AbandonRequest(String matchId, Long userId) {
+    }
+
+    public record AbandonResponse(boolean ok, String message) {
     }
 }

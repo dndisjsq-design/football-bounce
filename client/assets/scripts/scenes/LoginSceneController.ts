@@ -1,5 +1,5 @@
 import { director, Node } from 'cc';
-import { authMessage, loginAsGuest, loginWithPassword } from '../services/AuthService';
+import { authMessage, loginWithPassword, startGuestLogin, tryAutoLogin } from '../services/AuthService';
 import { onTap, onTapExpanded } from '../utils/CocosNodeUtils';
 import { ensureEditBox } from '../utils/EditBoxUtils';
 import { setAuthMessage } from './AuthSceneHelpers';
@@ -10,7 +10,7 @@ export function bindLoginScene(root: Node): void {
   setAuthMessage(root, 'TextHint', '');
   onTapExpanded(root, 'ButtonRegister', 16, 12, () => director.loadScene('Register'));
   onTap(root, 'ButtonGuestLogin', () => {
-    loginAsGuest();
+    startGuestLogin();
     director.loadScene('Home');
   });
   onTap(root, 'ButtonLogin', () => {

@@ -1,5 +1,7 @@
 package com.footballbounce.server.controller;
 
+import com.footballbounce.server.dto.match.SingleMatchDtos.AbandonRequest;
+import com.footballbounce.server.dto.match.SingleMatchDtos.AbandonResponse;
 import com.footballbounce.server.dto.match.SingleMatchDtos.AiKeeperRequest;
 import com.footballbounce.server.dto.match.SingleMatchDtos.AiKeeperResponse;
 import com.footballbounce.server.dto.match.SingleMatchDtos.AiShootRequest;
@@ -63,5 +65,10 @@ public class SingleMatchController {
     @PostMapping("/finish")
     public FinishResponse finish(@RequestBody FinishRequest request) {
         return singleMatchService.finish(request);
+    }
+
+    @PostMapping("/abandon")
+    public AbandonResponse abandon(@RequestBody AbandonRequest request) {
+        return singleMatchService.abandon(request);
     }
 }

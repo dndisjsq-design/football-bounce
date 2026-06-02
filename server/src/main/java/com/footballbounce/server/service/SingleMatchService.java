@@ -2,6 +2,8 @@ package com.footballbounce.server.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.footballbounce.server.dto.match.SingleMatchDtos.AbandonRequest;
+import com.footballbounce.server.dto.match.SingleMatchDtos.AbandonResponse;
 import com.footballbounce.server.dto.match.SingleMatchDtos.AiKeeperRequest;
 import com.footballbounce.server.dto.match.SingleMatchDtos.AiKeeperResponse;
 import com.footballbounce.server.dto.match.SingleMatchDtos.AiShootRequest;
@@ -118,9 +120,10 @@ public class SingleMatchService {
         String username = displayName(user);
         double fieldWidth = positiveOrDefault(request.fieldWidth(), DEFAULT_FIELD_WIDTH);
         double fieldHeight = positiveOrDefault(request.fieldHeight(), DEFAULT_FIELD_HEIGHT);
-        ServerMatchState state = new ServerMatchState(matchNo, userId, username, formationId, playerIds, lineupPlayers, fieldWidth, fieldHeight);
+        String clientSessionId = safeSessionId(request.clientSessionId());
+        ServerMatchState state = new ServerMatchState(matchNo, userId, username, clientSessionId, formationId, playerIds, lineupPlayers, fieldWidth, fieldHeight);
         state.resetObjects("home");
-        mapper.insertMatchRecord(matchNo, userId, username, "home", "single", null, "人机", formationId, formationId, String.join(",", playerIds), String.join(",", playerIds));
+        mapper.insertMatchRecord(matchNo, userId, username, "home", clientSessionId, "single", null, "人机", formationId, formationId, String.join(",", playerIds), String.join(",", playerIds));
         matches.put(matchNo, state);
         recordAction(state, "server", null, "start", null, true, "match started");
         return new StartResponse(
@@ -276,6 +279,23 @@ public class SingleMatchService {
         return new FinishResponse(true, "比赛结果已保存", settlement);
     }
 
+    @Transactional
+    public AbandonResponse abandon(AbandonRequest request) {
+        if (request == null || request.matchId() == null || request.matchId().isBlank()) {
+            return new AbandonResponse(false, "比赛编号为空");
+        }
+        long userId = request.userId() == null ? GUEST_USER_ID : request.userId();
+        ServerMatchState state = matches.remove(request.matchId());
+        String matchNo = state == null ? request.matchId() : state.matchNo;
+        if (mapper.countUnfinishedMatch(matchNo, userId) <= 0) {
+            return new AbandonResponse(true, "没有需要清理的未完成比赛");
+        }
+        mapper.deleteGoalsByMatchNo(matchNo);
+        mapper.deleteActionsByMatchNo(matchNo);
+        mapper.deleteUnfinishedMatchRecord(matchNo, userId);
+        return new AbandonResponse(true, "未完成比赛已删除");
+    }
+
     private StartResponse startFailed(String message) {
         return new StartResponse(false, message, null, null, null, null, null, List.of(), List.of(), null);
     }
@@ -358,6 +378,17 @@ public class SingleMatchService {
 
     private static String stringValue(Object value) {
         return value == null ? "" : String.valueOf(value);
+    }
+
+    private static String safeSessionId(String value) {
+        if (value == null) {
+            return "";
+        }
+        String trimmed = value.trim();
+        if (trimmed.length() > 96) {
+            return trimmed.substring(0, 96);
+        }
+        return trimmed;
     }
 
     private static String blankToDefault(String value, String fallback) {
@@ -488,6 +519,7 @@ public class SingleMatchService {
         private final String matchNo;
         private final long userId;
         private final String username;
+        private final String clientSessionId;
         private final String formationId;
         private final List<String> lineupIds;
         private final Map<String, PlayerSummary> lineupByPlayerId = new HashMap<>();
@@ -506,10 +538,11 @@ public class SingleMatchService {
         private boolean goalLocked = false;
         private long tick = 0;
 
-        private ServerMatchState(String matchNo, long userId, String username, String formationId, List<String> lineupIds, List<PlayerSummary> lineupPlayers, double fieldWidth, double fieldHeight) {
+        private ServerMatchState(String matchNo, long userId, String username, String clientSessionId, String formationId, List<String> lineupIds, List<PlayerSummary> lineupPlayers, double fieldWidth, double fieldHeight) {
             this.matchNo = matchNo;
             this.userId = userId;
             this.username = username;
+            this.clientSessionId = clientSessionId;
             this.formationId = formationId;
             this.lineupIds = List.copyOf(lineupIds);
             for (PlayerSummary player : lineupPlayers) {

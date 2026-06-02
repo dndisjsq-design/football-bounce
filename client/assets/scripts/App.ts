@@ -13,6 +13,7 @@ import { bindPlayersScene } from './scenes/PlayersSceneController';
 import { bindRegisterScene } from './scenes/RegisterSceneController';
 import { bindShopPackScene } from './scenes/ShopPackSceneController';
 import { bindShopFormationScene, bindShopHomeScene, bindShopPlayerScene } from './scenes/ShopSceneController';
+import { consumeSelectedReplayMatchId } from './services/MatchRecordService';
 import { MusicManager } from './services/MusicManager';
 import { cleanTextRenderers, ensureCameraClearsFrame, onTap } from './utils/CocosNodeUtils';
 
@@ -62,8 +63,9 @@ export class App extends Component {
       this.match = null;
       director.loadScene('Home');
     });
-    const transport = selectedMatchMode === 'online' ? new OnlineMatchTransport() : new LocalMatchTransport();
-    this.match = new EditableMatch(this.node, selectedMatchMode, transport);
+    const replayMatchId = consumeSelectedReplayMatchId();
+    const transport = selectedMatchMode === 'online' && !replayMatchId ? new OnlineMatchTransport() : new LocalMatchTransport();
+    this.match = new EditableMatch(this.node, replayMatchId ? 'ai' : selectedMatchMode, transport, replayMatchId);
     this.match.start();
   }
 }

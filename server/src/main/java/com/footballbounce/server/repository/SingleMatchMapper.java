@@ -6,6 +6,7 @@ import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.Delete;
 import org.apache.ibatis.annotations.Update;
 
 @Mapper
@@ -57,6 +58,7 @@ public interface SingleMatchMapper {
                 user_id,
                 username,
                 user_side,
+                client_session_id,
                 match_time,
                 match_type,
                 duration_seconds,
@@ -75,6 +77,7 @@ public interface SingleMatchMapper {
                 #{userId},
                 #{username},
                 #{userSide},
+                #{clientSessionId},
                 NOW(6),
                 #{matchType},
                 0,
@@ -95,6 +98,7 @@ public interface SingleMatchMapper {
             @Param("userId") Long userId,
             @Param("username") String username,
             @Param("userSide") String userSide,
+            @Param("clientSessionId") String clientSessionId,
             @Param("matchType") String matchType,
             @Param("opponentUserId") Long opponentUserId,
             @Param("opponentUsername") String opponentUsername,
@@ -200,4 +204,33 @@ public interface SingleMatchMapper {
             @Param("resultScore") String resultScore,
             @Param("result") String result
     );
+
+    @Select("""
+            SELECT COUNT(1)
+            FROM user_match_record
+            WHERE match_no = #{matchNo}
+              AND user_id = #{userId}
+              AND result IS NULL
+            """)
+    int countUnfinishedMatch(@Param("matchNo") String matchNo, @Param("userId") Long userId);
+
+    @Delete("""
+            DELETE FROM match_goal_record
+            WHERE match_no = #{matchNo}
+            """)
+    int deleteGoalsByMatchNo(@Param("matchNo") String matchNo);
+
+    @Delete("""
+            DELETE FROM match_action
+            WHERE match_no = #{matchNo}
+            """)
+    int deleteActionsByMatchNo(@Param("matchNo") String matchNo);
+
+    @Delete("""
+            DELETE FROM user_match_record
+            WHERE match_no = #{matchNo}
+              AND user_id = #{userId}
+              AND result IS NULL
+            """)
+    int deleteUnfinishedMatchRecord(@Param("matchNo") String matchNo, @Param("userId") Long userId);
 }

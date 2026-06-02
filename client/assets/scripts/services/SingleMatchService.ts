@@ -1,6 +1,6 @@
 import { MatchEvent, MatchSnapshot, ShootCommand } from '../MatchTypes';
 import { RosterPlayer } from './PlayerRosterService';
-import { getCurrentUserId, postJson } from './AuthService';
+import { getCurrentGuestSessionId, getCurrentUserId, postJson } from './AuthService';
 
 export interface SingleMatchStartResponse {
   ok: boolean;
@@ -76,6 +76,7 @@ export interface MatchSettlement {
 export function startSingleMatch(fieldWidth: number, fieldHeight: number): Promise<SingleMatchStartResponse> {
   return postJson<SingleMatchStartResponse>('/single-match/start', {
     userId: getCurrentUserId(),
+    clientSessionId: getCurrentGuestSessionId(),
     fieldWidth,
     fieldHeight,
   });
@@ -127,5 +128,12 @@ export function finishSingleMatch(matchId: string, durationSeconds: number, scor
     score,
     result,
     resultScore,
+  });
+}
+
+export function abandonSingleMatch(matchId: string): Promise<{ ok: boolean; message: string }> {
+  return postJson<{ ok: boolean; message: string }>('/single-match/abandon', {
+    matchId,
+    userId: getCurrentUserId(),
   });
 }

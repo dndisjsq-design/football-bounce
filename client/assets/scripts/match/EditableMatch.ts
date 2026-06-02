@@ -5,6 +5,7 @@ import { getCurrentUserDisplayName } from '../services/AuthService';
 import { getMatchFormationPoints, getMatchFormationPointsById } from '../services/FormationService';
 import { RosterPlayer, getLineupPlayers } from '../services/PlayerRosterService';
 import {
+  abandonSingleMatch,
   finishSingleMatch,
   requestSingleMatchAiKeeper,
   requestSingleMatchAiShoot,
@@ -14,6 +15,7 @@ import {
   validateSingleMatchSnapshot,
   MatchSettlement,
 } from '../services/SingleMatchService';
+import { MatchActionRecord, MatchReplayData, fetchMatchReplay, parseShootCommand } from '../services/MatchRecordService';
 import { findNode, rgba } from '../utils/CocosNodeUtils';
 
 const MATCH_ID = 'editable-scene-preview';
@@ -47,7 +49,7 @@ const CORNER_CUSHION_RADIUS = 36;
 const CORNER_CUSHION_RESTITUTION = 0.92;
 const PENALTY_HALF_WIDTH = GOAL_HALF_WIDTH + 34;
 const PENALTY_DEPTH = 86;
-const MATCH_SECONDS = 1;
+const MATCH_SECONDS = 180;
 const TURN_SECONDS = 15;
 const WIN_SCORE = 3;
 const GOAL_CELEBRATION_SECONDS = 3;
@@ -134,17 +136,30 @@ export class EditableMatch {
   private singleMatchHomeLineup: Array<RosterPlayer | null> = [];
   private singleMatchAwayLineup: Array<RosterPlayer | null> = [];
   private singleMatchSettlement: MatchSettlement | null = null;
+  private replayMatchId = '';
+  private replayMode = false;
+  private replayData: MatchReplayData | null = null;
+  private replayActions: MatchActionRecord[] = [];
+  private replayActionIndex = 0;
+  private replayDelay = 0.35;
+  private replayFinished = false;
 
-  constructor(canvas: Node, mode: MatchMode, transport: MatchTransport) {
+  constructor(canvas: Node, mode: MatchMode, transport: MatchTransport, replayMatchId = '') {
     this.canvas = canvas;
     this.mode = mode;
     this.transport = transport;
+    this.replayMatchId = replayMatchId;
   }
 
   start(): void {
     this.removeLegacyBottomScoreboard();
     const title = findNode(this.canvas, 'TextMode')?.getComponent(Label);
     if (title) title.string = `${this.score.home} : ${this.score.away}`;
+    if (this.replayMatchId) {
+      this.hideRuntimeMatchObjects();
+      void this.startReplayFromServer();
+      return;
+    }
     this.transport.onRemoteShoot((command) => this.applyShoot(command));
     this.transport.onSnapshot((snapshot) => this.applySnapshot(snapshot));
     void this.transport.connect(MATCH_ID).catch(() => undefined);
@@ -161,6 +176,14 @@ export class EditableMatch {
   }
 
   tick(dt: number): void {
+    if (this.replayMode) {
+      this.updateGoalCelebration(dt);
+      this.updateReplay(dt);
+      this.step(dt);
+      this.tickIndex += 1;
+      this.syncNodes();
+      return;
+    }
     this.updateGoalCelebration(dt);
     this.updateClocks(dt);
     this.updatePenaltyShootout(dt);
@@ -206,6 +229,33 @@ export class EditableMatch {
     }
   }
 
+  private async startReplayFromServer(): Promise<void> {
+    try {
+      const response = await fetchMatchReplay(this.replayMatchId);
+      if (!response.ok || !response.record) throw new Error(response.message || '回放数据读取失败');
+      this.replayMode = true;
+      this.replayData = response;
+      this.replayActions = response.actions.filter((action) => action.validResult !== false);
+      this.replayActionIndex = 0;
+      this.replayDelay = 0.45;
+      this.replayFinished = false;
+      this.activeMatchId = response.record.matchId;
+      this.singleMatchHomeFormationId = response.record.homeFormationId;
+      this.singleMatchAwayFormationId = response.record.awayFormationId || response.record.homeFormationId;
+      this.singleMatchHomeLineup = normalizeLineup(response.homeLineup);
+      this.singleMatchAwayLineup = normalizeLineup(response.awayLineup || response.homeLineup);
+      this.resetObjects('home');
+      this.prepareMatchHud();
+      this.setReplayHudLabels(response);
+      this.prepareMatchRenderer();
+      this.syncNodes();
+    } catch (error) {
+      const title = findNode(this.canvas, 'TextMode')?.getComponent(Label);
+      if (title) title.string = error instanceof Error ? error.message : '回放数据读取失败';
+      this.hideRuntimeMatchObjects();
+    }
+  }
+
   private resetObjects(startingTurn: TeamSide = 'home'): void {
     const fw = this.fieldWidth;
     const fh = this.fieldHeight;
@@ -234,6 +284,92 @@ export class EditableMatch {
       ...awayPoints.map((point, index) => makePlayer(`away-${index + 1}`, 'away', point.x, point.y)),
     ];
     this.resolveAllCollisions();
+  }
+
+  private setReplayHudLabels(response: MatchReplayData): void {
+    const hud = this.ensureHudNode();
+    const home = findNode(hud, 'HudHomeName')?.getComponent(Label);
+    const away = findNode(hud, 'HudAwayName')?.getComponent(Label);
+    const mode = findNode(hud, 'HudModeName')?.getComponent(Label);
+    const title = findNode(this.canvas, 'TextMode')?.getComponent(Label);
+    if (home) home.string = this.matchDisplayName();
+    if (away) away.string = response.record?.opponentUsername || '人机';
+    if (mode) mode.string = '比赛回放';
+    if (title) title.string = response.record?.resultScore || '0 : 0';
+  }
+
+  private updateReplay(dt: number): void {
+    if (!this.replayMode || this.replayFinished || this.goalCelebrationRemaining > 0) return;
+    if (!this.isSettled()) return;
+    if (this.replayDelay > 0) {
+      this.replayDelay = Math.max(0, this.replayDelay - dt);
+      return;
+    }
+    const action = this.nextReplayAction();
+    if (!action) {
+      this.replayFinished = true;
+      const mode = findNode(this.ensureHudNode(), 'HudModeName')?.getComponent(Label);
+      if (mode) mode.string = '回放结束';
+      return;
+    }
+    this.applyReplayAction(action);
+  }
+
+  private nextReplayAction(): MatchActionRecord | null {
+    while (this.replayActionIndex < this.replayActions.length) {
+      const action = this.replayActions[this.replayActionIndex];
+      this.replayActionIndex += 1;
+      if (action.actionType === 'shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty' || action.actionType === 'event-goal' || action.actionType === 'kickoff-reset' || action.actionType === 'finish') {
+        return action;
+      }
+    }
+    return null;
+  }
+
+  private applyReplayAction(action: MatchActionRecord): void {
+    if (action.actionType === 'shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty') {
+      const command = parseShootCommand(action);
+      if (!command) return;
+      this.applyShoot({ ...command, matchId: this.activeMatchId });
+      this.replayDelay = 0.2;
+      return;
+    }
+    if (action.actionType === 'event-goal') {
+      this.applyReplayGoal(action);
+      return;
+    }
+    if (action.actionType === 'kickoff-reset') {
+      this.resetObjects(action.actorSide === 'away' ? 'away' : 'home');
+      this.replayDelay = 0.25;
+      return;
+    }
+    if (action.actionType === 'finish') {
+      this.replayFinished = true;
+      const mode = findNode(this.ensureHudNode(), 'HudModeName')?.getComponent(Label);
+      if (mode) mode.string = '回放结束';
+    }
+  }
+
+  private applyReplayGoal(action: MatchActionRecord): void {
+    let payload: { side?: TeamSide; score?: { home: number; away: number } } = {};
+    try {
+      payload = action.commandJson ? JSON.parse(action.commandJson) as { side?: TeamSide; score?: { home: number; away: number } } : {};
+    } catch {
+      payload = {};
+    }
+    const side = payload.side === 'away' ? 'away' : 'home';
+    if (payload.score) {
+      this.score = { ...payload.score };
+    } else {
+      this.score[side] += 1;
+    }
+    this.stopBallInGoal();
+    this.goalScorer = side;
+    this.pendingKickoffTurn = side === 'home' ? 'away' : 'home';
+    this.goalCelebrationRemaining = Math.min(1.4, GOAL_CELEBRATION_SECONDS);
+    this.goalCelebrationElapsed = 0;
+    this.celebrationKind = 'goal';
+    this.replayDelay = 0.35;
   }
 
   private prepareMatchHud(): void {
@@ -1958,7 +2094,7 @@ export class EditableMatch {
   }
 
   private matchLineup(side: TeamSide): Array<RosterPlayer | null> {
-    if (this.mode === 'ai' && this.singleMatchServerReady) {
+    if (this.replayMode || (this.mode === 'ai' && this.singleMatchServerReady)) {
       return side === 'home' ? this.singleMatchHomeLineup : this.singleMatchAwayLineup;
     }
     return side === 'home' ? getLineupPlayers() : [];
@@ -2044,6 +2180,9 @@ export class EditableMatch {
   }
 
   dispose(): void {
+    if (this.mode === 'ai' && !this.replayMode && this.singleMatchServerReady && !this.singleMatchFinishSent && this.activeMatchId !== MATCH_ID) {
+      void abandonSingleMatch(this.activeMatchId).catch(() => undefined);
+    }
     this.clearDragAim();
     this.fieldGraphics = null;
     if (this.aimGraphics?.node?.isValid) this.aimGraphics.node.destroy();
@@ -2096,6 +2235,7 @@ export class EditableMatch {
   }
 
   private emitMatchEvent(event: Pick<MatchEvent, 'type' | 'side' | 'actorId' | 'matchSecond' | 'penalty' | 'ownGoal'>): void {
+    if (this.replayMode) return;
     const payload: MatchEvent = {
       eventId: nextId(event.type),
       matchId: this.activeMatchId,

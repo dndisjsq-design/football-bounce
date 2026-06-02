@@ -169,6 +169,7 @@ CREATE TABLE IF NOT EXISTS user_match_record (
   user_id BIGINT NOT NULL,
   username VARCHAR(64) NOT NULL,
   user_side VARCHAR(16) NOT NULL DEFAULT 'home',
+  client_session_id VARCHAR(96) NULL,
   match_time DATETIME(6) NOT NULL,
   match_type VARCHAR(16) NOT NULL,
   duration_seconds INT NOT NULL DEFAULT 0,
@@ -185,6 +186,7 @@ CREATE TABLE IF NOT EXISTS user_match_record (
   PRIMARY KEY (id),
   KEY idx_user_match_record_no (match_no),
   KEY idx_user_match_record_user_time (user_id, match_time),
+  KEY idx_user_match_record_session (user_id, client_session_id, match_time),
   KEY idx_user_match_record_type (match_type),
   CONSTRAINT fk_user_match_record_user
     FOREIGN KEY (user_id) REFERENCES user_account (id)

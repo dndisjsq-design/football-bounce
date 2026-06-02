@@ -25,6 +25,7 @@ const AUTH_TOKEN_KEY = 'footballBounce.authToken';
 const AUTH_USER_KEY = 'footballBounce.authUser';
 const AUTH_EXPIRES_AT_KEY = 'footballBounce.authExpiresAt';
 const GUEST_USER_ID = 1;
+const GUEST_SESSION_ID_KEY = 'footballBounce.guestSessionId';
 
 function resolveApiBaseUrl(): string {
   const browserLocation = (globalThis as { location?: { protocol?: string; hostname?: string } }).location;
@@ -45,7 +46,9 @@ export function authMessage(response: AuthResponse): string {
 }
 
 export function loginWithPassword(username: string, password: string): Promise<AuthResponse> {
+  const previousGuestSessionId = getCurrentGuestSessionId();
   return postAuth('/auth/login', { username, password, deviceId: getOrCreateDeviceId() }).then((response) => {
+    if (response.code === 'SUCCESS' && previousGuestSessionId) clearGuestMatchRecords(previousGuestSessionId);
     saveAuthSession(response);
     return response;
   });
@@ -81,13 +84,23 @@ export function tryAutoLogin(): Promise<AuthResponse | null> {
 }
 
 export function logoutCurrentDevice(): void {
+  const guestSessionId = getCurrentGuestSessionId();
+  const guest = isCurrentUserGuest();
   const authToken = sys.localStorage.getItem(AUTH_TOKEN_KEY) || '';
   const deviceId = getOrCreateDeviceId();
   clearAuthSession();
+  if (guest && guestSessionId) clearGuestMatchRecords(guestSessionId);
   if (!authToken) return;
   void postAuth('/auth/logout', { deviceId, authToken }).catch(() => {
     // Local logout should succeed even when the server is temporarily unreachable.
   });
+}
+
+export function startGuestLogin(): void {
+  const previousGuestSessionId = getCurrentGuestSessionId();
+  if (previousGuestSessionId) clearGuestMatchRecords(previousGuestSessionId);
+  loginAsGuest();
+  sys.localStorage.setItem(GUEST_SESSION_ID_KEY, `guest-${Date.now().toString(36)}-${randomHex(12)}`);
 }
 
 export function getCurrentUserDisplayName(): string {
@@ -112,14 +125,24 @@ export function getCurrentUserId(): number | null {
   }
 }
 
+export function getCurrentGuestSessionId(): string {
+  return sys.localStorage.getItem(GUEST_SESSION_ID_KEY) || '';
+}
+
+export function isCurrentUserGuest(): boolean {
+  return getCurrentUserId() === 1 && !!getCurrentGuestSessionId();
+}
+
 export function clearAuthSession(): void {
   sys.localStorage.removeItem(AUTH_TOKEN_KEY);
   sys.localStorage.removeItem(AUTH_USER_KEY);
   sys.localStorage.removeItem(AUTH_EXPIRES_AT_KEY);
+  sys.localStorage.removeItem(GUEST_SESSION_ID_KEY);
 }
 
 function saveAuthSession(response: AuthResponse): void {
   if (response.code !== 'SUCCESS') return;
+  sys.localStorage.removeItem(GUEST_SESSION_ID_KEY);
   if (response.user) sys.localStorage.setItem(AUTH_USER_KEY, JSON.stringify(response.user));
   if (typeof response.user?.coins === 'number') setCurrentCoins(response.user.coins);
   if (response.authToken) sys.localStorage.setItem(AUTH_TOKEN_KEY, response.authToken);
@@ -150,6 +173,15 @@ function randomHex(byteLength: number): string {
 
 export function postAuth(path: string, body: Record<string, string>): Promise<AuthResponse> {
   return postJson<AuthResponse>(path, body);
+}
+
+function clearGuestMatchRecords(guestSessionId: string): void {
+  void postJson('/match-records/guest-session/clear', {
+    userId: 1,
+    guestSessionId,
+  }).catch(() => {
+    // Guest cleanup is best-effort; a new guest session id still isolates future queries.
+  });
 }
 
 export function postJson<T>(path: string, body: unknown, timeoutMs = 8000): Promise<T> {
