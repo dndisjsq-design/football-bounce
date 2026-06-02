@@ -1,7 +1,7 @@
 import { sys } from 'cc';
 import { setCurrentCoins } from './WalletService';
 
-const DEV_BACKEND_HOST = '192.168.3.44';
+const DEV_BACKEND_HOST = '192.168.43.145';
 
 export const AUTH_API_BASE_URL = resolveApiBaseUrl();
 
@@ -114,14 +114,14 @@ export function getCurrentUserDisplayName(): string {
   }
 }
 
-export function getCurrentUserId(): number | null {
+export function getCurrentUserId(): number {
   const saved = sys.localStorage.getItem(AUTH_USER_KEY);
-  if (!saved) return null;
+  if (!saved) return GUEST_USER_ID;
   try {
     const user = JSON.parse(saved) as { id?: number };
-    return typeof user.id === 'number' ? user.id : null;
+    return Number.isFinite(user.id) && user.id! > 0 ? user.id! : GUEST_USER_ID;
   } catch {
-    return null;
+    return GUEST_USER_ID;
   }
 }
 

@@ -8,6 +8,16 @@ export function bindLoginScene(root: Node): void {
   const usernameInput = ensureEditBox(root, 'InputAccount', '', false);
   const passwordInput = ensureEditBox(root, 'InputPassword', '', true);
   setAuthMessage(root, 'TextHint', '');
+  void tryAutoLogin().then((response) => {
+    if (!response) return;
+    if (response.code === 'SUCCESS') {
+      director.loadScene('Home');
+      return;
+    }
+    setAuthMessage(root, 'TextHint', authMessage(response), false);
+  }).catch(() => {
+    setAuthMessage(root, 'TextHint', '自动登录失败，请手动登录', false);
+  });
   onTapExpanded(root, 'ButtonRegister', 16, 12, () => director.loadScene('Register'));
   onTap(root, 'ButtonGuestLogin', () => {
     startGuestLogin();
