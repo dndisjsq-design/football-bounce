@@ -1,7 +1,7 @@
 import { sys } from 'cc';
 import { setCurrentCoins } from './WalletService';
 
-const DEV_BACKEND_HOST = '192.168.43.145';
+const DEV_BACKEND_HOST = '192.168.3.45';
 
 export const AUTH_API_BASE_URL = resolveApiBaseUrl();
 

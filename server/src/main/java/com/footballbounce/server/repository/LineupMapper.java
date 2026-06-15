@@ -95,6 +95,16 @@ public interface LineupMapper {
     List<PlayerData> findAllPlayers();
 
     @Select("""
+            SELECT p.player_id AS playerId, p.name, p.score, p.rarity, p.avatar_seed AS avatarSeed,
+                   p.intro, p.body_type AS bodyType, p.nationality, p.club, p.height, p.weight, p.age,
+                   p.skills, p.power, p.accuracy, p.curve, p.stamina, p.body_strength AS bodyStrength
+            FROM player_data p
+            WHERE p.player_id = #{playerId}
+            LIMIT 1
+            """)
+    PlayerData findPlayerById(@Param("playerId") String playerId);
+
+    @Select("""
             SELECT formation_id
             FROM user_owned_formation
             WHERE user_id = #{userId}

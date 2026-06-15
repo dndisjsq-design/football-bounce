@@ -1,7 +1,7 @@
 import { Color, EventTouch, Graphics, Label, Mask, MaskType, Node, Sprite, UITransform, director } from 'cc';
 import { FormationDefinition, getPreviewFormationPoints, getShopFormations } from '../services/FormationService';
 import { PlayerRarity, RosterPlayer } from '../services/PlayerRosterService';
-import { fetchShopPlayers } from '../services/ShopCatalogApiService';
+import { ShopPlayerDetail, fetchShopPlayerDetail, fetchShopPlayers } from '../services/ShopCatalogApiService';
 import { getCurrentCoins } from '../services/WalletService';
 import { drawPlayerAvatar, renderPricedPlayerCard } from '../ui/PlayerCardView';
 import { findNode, onTap, rgba } from '../utils/CocosNodeUtils';
@@ -22,22 +22,6 @@ interface ScrollState {
   offset: number;
   startY: number;
   startOffset: number;
-}
-
-interface PlayerShopProfile {
-  intro: string;
-  bodyType: string;
-  nationality: string;
-  club: string;
-  height: number;
-  weight: number;
-  age: number;
-  power: number;
-  accuracy: number;
-  curve: number;
-  stamina: number;
-  body: number;
-  skills: string;
 }
 
 interface PlayerDetailOptions {
@@ -382,45 +366,99 @@ function bindCardTap(card: Node, handler: () => void): void {
 export function showPlayerDetail(root: Node, player: RosterPlayer, options: PlayerDetailOptions = { showPurchase: true }): void {
   const overlay = createOverlay(root);
   const panel = createPanel(overlay, 'PlayerDetailPanel', 0, -4, 350, 716);
-  const profile = getPlayerProfile(player);
-  const price = getPlayerPrice(player);
   const showPurchase = options.showPurchase !== false;
-  const rarity = rarityName(player.rarity);
 
-  createDetailLabel(panel, 'PlayerDetailTitle', player.name, 0, 320, 30, 300, 40, rgba(255, 246, 130), true);
-  createDetailLabel(panel, 'PlayerDetailRarity', `${rarity}球员  |  评分 ${player.score}  |  价格 ${price}`, 0, 290, 14, 320, 24, rgba(255, 221, 92), true);
+  const title = createDetailLabel(panel, 'PlayerDetailTitle', '加载中...', 0, 320, 30, 300, 40, rgba(255, 246, 130), true);
+  const meta = createDetailLabel(panel, 'PlayerDetailRarity', '正在从后端读取球员详情', 0, 290, 14, 320, 24, rgba(255, 221, 92), true);
 
   const avatar = createUiNode(panel, 'PlayerDetailAvatar', -112, 246, 82, 82);
   const avatarGraphics = avatar.addComponent(Graphics);
-  drawPlayerAvatar(avatarGraphics, 0, 0, 36, player);
-  createTextBox(panel, 'PlayerDetailIntroBox', 58, 232, 198, 80, profile.intro, 13, 12);
+  drawAvatarPlaceholder(avatarGraphics, 0, 0, 36);
+  const introBox = createTextBox(panel, 'PlayerDetailIntroBox', 58, 232, 198, 80, '', 13, 12);
+  setTextBoxValue(introBox, 'PlayerDetailIntroBox', '等待后端数据...', 12);
 
-  const rows: Array<[string, string]> = [
-    ['能力值', String(player.score)],
-    ['体型', profile.bodyType],
-    ['国籍', profile.nationality],
-    ['俱乐部', profile.club],
-    ['身高体重', `${profile.height}cm / ${profile.weight}kg`],
-    ['年龄', `${profile.age}岁`],
-    ['技能介绍', profile.skills],
-    ['力度大小', String(profile.power)],
-    ['准度（方向线长度）', String(profile.accuracy)],
-    ['弧度', String(profile.curve)],
-    ['体力', String(profile.stamina)],
-    ['身体强度', String(profile.body)],
-  ];
-  rows.forEach(([label, value], index) => {
+  const rowLabels = ['能力值', '体型', '国籍', '俱乐部', '身高体重', '年龄', '技能介绍', '力度大小', '准度（方向线长度）', '弧度', '体力', '身体强度'];
+  const valueLabels = rowLabels.map((label, index) => {
     const y = 156 - index * 28;
     createDetailLabel(panel, `PlayerDetailKey_${index}`, label, -96, y, 13, 120, 24, rgba(159, 189, 230), true, Label.HorizontalAlign.LEFT);
-    createDetailLabel(panel, `PlayerDetailValue_${index}`, value, 64, y, 13, 188, 24, rgba(245, 249, 255), index === 0, Label.HorizontalAlign.LEFT);
+    return createDetailLabel(panel, `PlayerDetailValue_${index}`, '--', 64, y, 13, 188, 24, rgba(245, 249, 255), index === 0, Label.HorizontalAlign.LEFT);
   });
 
   createDetailButton(panel, 'PlayerDetailClose', '关闭', showPurchase ? -86 : 0, -322, 112, 42, rgba(84, 102, 132), () => overlay.destroy());
+  let loadedDetail: ShopPlayerDetail | null = null;
   if (showPurchase) {
-    createDetailButton(panel, 'PlayerDetailBuy', '购买', 86, -322, 112, 42, rgba(255, 128, 31), () => {
-      showPurchaseConfirm(overlay, player.name, price);
+    const buyButton = createDetailButton(panel, 'PlayerDetailBuy', '购买', 86, -322, 112, 42, rgba(255, 128, 31), () => {
+      if (!loadedDetail) return;
+      showPurchaseConfirm(overlay, loadedDetail.name, loadedDetail.price);
+    });
+    buyButton.active = false;
+    void fetchShopPlayerDetail(player.id).then((detail) => {
+      loadedDetail = detail;
+      buyButton.active = true;
+      fillPlayerDetail(title, meta, avatarGraphics, introBox, valueLabels, detail, true);
+    }).catch((error: Error) => {
+      fillPlayerDetailError(title, meta, introBox, valueLabels, error);
+    });
+  } else {
+    void fetchShopPlayerDetail(player.id).then((detail) => {
+      loadedDetail = detail;
+      fillPlayerDetail(title, meta, avatarGraphics, introBox, valueLabels, detail, false);
+    }).catch((error: Error) => {
+      fillPlayerDetailError(title, meta, introBox, valueLabels, error);
     });
   }
+}
+
+function fillPlayerDetail(
+  title: Label,
+  meta: Label,
+  avatarGraphics: Graphics,
+  introBox: Node,
+  valueLabels: Label[],
+  detail: ShopPlayerDetail,
+  showPrice: boolean,
+): void {
+  title.string = detail.name;
+  meta.string = `${rarityName(detail.rarity)}球员  |  评分 ${detail.score}${showPrice ? `  |  价格 ${detail.price}` : ''}`;
+  avatarGraphics.clear();
+  drawPlayerAvatar(avatarGraphics, 0, 0, 36, detail);
+  setTextBoxValue(introBox, 'PlayerDetailIntroBox', detail.intro, 12);
+  const values = [
+    String(detail.score),
+    detail.bodyType,
+    detail.nationality,
+    detail.club,
+    `${detail.height}cm / ${detail.weight}kg`,
+    `${detail.age}岁`,
+    detail.skills,
+    String(detail.power),
+    String(detail.accuracy),
+    String(detail.curve),
+    String(detail.stamina),
+    String(detail.bodyStrength),
+  ];
+  valueLabels.forEach((label, index) => {
+    label.string = values[index] || '--';
+  });
+}
+
+function fillPlayerDetailError(title: Label, meta: Label, introBox: Node, valueLabels: Label[], error: Error): void {
+  title.string = '详情加载失败';
+  meta.string = error.message || '无法连接球员详情服务器';
+  setTextBoxValue(introBox, 'PlayerDetailIntroBox', '请确认后端服务已开启后重试。', 12);
+  valueLabels.forEach((label) => {
+    label.string = '--';
+  });
+}
+
+function drawAvatarPlaceholder(g: Graphics, x: number, y: number, radius: number): void {
+  g.clear();
+  g.fillColor = rgba(255, 255, 255, 70);
+  g.circle(x, y, radius + 2);
+  g.fill();
+  g.fillColor = rgba(24, 45, 78, 230);
+  g.circle(x, y, radius);
+  g.fill();
 }
 
 function showFormationDetail(root: Node, formation: FormationDefinition): void {
@@ -500,6 +538,11 @@ function createTextBox(parent: Node, name: string, x: number, y: number, width: 
   g.stroke();
   createDetailLabel(box, `${name}_Text`, wrapText(text, maxCharsPerLine), 0, 0, fontSize, width - 16, height - 14, rgba(231, 241, 255), false, Label.HorizontalAlign.LEFT, true, Label.VerticalAlign.TOP);
   return box;
+}
+
+function setTextBoxValue(box: Node, name: string, text: string, maxCharsPerLine: number): void {
+  const label = findNode(box, `${name}_Text`)?.getComponent(Label);
+  if (label) label.string = wrapText(text, maxCharsPerLine);
 }
 
 function wrapText(text: string, maxCharsPerLine: number): string {
@@ -598,34 +641,6 @@ function showPurchaseConfirm(overlay: Node, itemName: string, price: number): vo
   createDetailButton(panel, 'PurchaseConfirmButton', '确认', 70, -68, 104, 40, rgba(255, 128, 31), () => {
     shade.destroy();
   });
-}
-
-function getPlayerProfile(player: RosterPlayer): PlayerShopProfile {
-  const seed = player.avatarSeed;
-  const score = player.score;
-  const style = ['直线爆破', '弧线控场', '贴墙反弹', '二次补射', '防守卡位'][seed % 5];
-  const temperament = ['我喜欢把节奏拉快，用第一脚弹射打开局面。', '我会先看角度，再用弧线把球送到最难防的位置。', '我不怕身体对抗，越混乱越能抢到第二落点。', '我擅长贴边走位，能把死角变成进攻路线。'][seed % 4];
-  const skillA = ['强力弹射', '精准制导', '外弧修正', '撞墙加速', '稳定回防'][seed % 5];
-  const skillB = ['禁区抢点', '长线推进', '角度封锁', '连续碰撞', '耐力压制'][(seed + 2) % 5];
-  const bodyType = ['灵巧型', '均衡型', '精瘦型', '强壮型', '高大型', '爆发型'][seed % 6];
-  const nationality = ['巴西', '阿根廷', '葡萄牙', '法国', '英格兰', '西班牙', '德国', '意大利', '荷兰', '日本'][(seed + score) % 10];
-  const club = ['绿茵闪电', '北城弹射', '海港飞翼', '山城火炮', '蓝湾竞技', '红塔联队', '银河冲锋', '星河守卫'][(seed * 3 + score) % 8];
-  const rarityBoost = player.rarity === 'red' ? 8 : player.rarity === 'orange' ? 5 : player.rarity === 'purple' ? 2 : 0;
-  return {
-    intro: `${temperament}定位是${style}。`,
-    bodyType,
-    nationality,
-    club,
-    height: 168 + ((seed * 7) % 27),
-    weight: 62 + ((seed * 5) % 25),
-    age: 18 + ((seed * 3) % 17),
-    power: clamp(score + rarityBoost - (seed % 3), 1, 100),
-    accuracy: clamp(score - 3 + (seed % 6), 1, 100),
-    curve: clamp(score - 7 + ((seed * 2) % 9), 1, 100),
-    stamina: clamp(score - 4 + ((seed + 3) % 7), 1, 100),
-    body: clamp(score - 6 + ((seed + 1) % 8), 1, 100),
-    skills: `${skillA} / ${skillB}`,
-  };
 }
 
 function getFormationIntro(formation: FormationDefinition): string {
