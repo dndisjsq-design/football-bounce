@@ -1,6 +1,6 @@
 import { MatchEvent, MatchSnapshot, ShootCommand } from '../MatchTypes';
 import { RosterPlayer } from './PlayerRosterService';
-import { getCurrentGuestSessionId, getCurrentUserId, postJson } from './AuthService';
+import { getCurrentGuestSessionId, getCurrentUserId, postJson, type UserSummary } from './AuthService';
 
 export interface SingleMatchStartResponse {
   ok: boolean;
@@ -121,8 +121,8 @@ export function sendSingleMatchEvent(matchId: string, event: MatchEvent): Promis
   });
 }
 
-export function finishSingleMatch(matchId: string, durationSeconds: number, score: { home: number; away: number }, result: string, resultScore: string): Promise<{ ok: boolean; message: string; settlement?: MatchSettlement }> {
-  return postJson<{ ok: boolean; message: string; settlement?: MatchSettlement }>('/single-match/finish', {
+export function finishSingleMatch(matchId: string, durationSeconds: number, score: { home: number; away: number }, result: string, resultScore: string): Promise<{ ok: boolean; message: string; settlement?: MatchSettlement; userSummary?: UserSummary }> {
+  return postJson<{ ok: boolean; message: string; settlement?: MatchSettlement; userSummary?: UserSummary }>('/single-match/finish', {
     matchId,
     durationSeconds,
     score,

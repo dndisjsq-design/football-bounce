@@ -1,10 +1,13 @@
 package com.footballbounce.server.controller;
 
+import com.footballbounce.server.dto.ApiResponse;
 import com.footballbounce.server.dto.AuthResponse;
 import com.footballbounce.server.dto.AutoLoginRequest;
+import com.footballbounce.server.dto.GuestResetRequest;
 import com.footballbounce.server.dto.LoginRequest;
 import com.footballbounce.server.dto.LogoutRequest;
 import com.footballbounce.server.dto.RegisterRequest;
+import com.footballbounce.server.service.GuestAccountService;
 import com.footballbounce.server.service.UserService;
 import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -17,9 +20,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class AuthController {
 
     private final UserService userService;
+    private final GuestAccountService guestAccountService;
 
-    public AuthController(UserService userService) {
+    public AuthController(UserService userService, GuestAccountService guestAccountService) {
         this.userService = userService;
+        this.guestAccountService = guestAccountService;
     }
 
     @PostMapping("/login")
@@ -40,5 +45,10 @@ public class AuthController {
     @PostMapping("/register")
     public AuthResponse register(@Valid @RequestBody RegisterRequest request) {
         return userService.register(request);
+    }
+
+    @PostMapping("/guest/reset")
+    public ApiResponse<Void> resetGuest(@RequestBody GuestResetRequest request) {
+        return guestAccountService.resetGuest(request);
     }
 }

@@ -122,6 +122,16 @@ public interface MatchRecordMapper {
     int deleteGuestGoals(@Param("userId") long userId, @Param("guestSessionId") String guestSessionId);
 
     @Delete("""
+            DELETE FROM match_goal_record
+            WHERE match_no IN (
+                SELECT match_no
+                FROM user_match_record
+                WHERE user_id = #{userId}
+            )
+            """)
+    int deleteAllGuestGoals(@Param("userId") long userId);
+
+    @Delete("""
             DELETE FROM match_action
             WHERE match_no IN (
                 SELECT match_no
@@ -133,9 +143,25 @@ public interface MatchRecordMapper {
     int deleteGuestActions(@Param("userId") long userId, @Param("guestSessionId") String guestSessionId);
 
     @Delete("""
+            DELETE FROM match_action
+            WHERE match_no IN (
+                SELECT match_no
+                FROM user_match_record
+                WHERE user_id = #{userId}
+            )
+            """)
+    int deleteAllGuestActions(@Param("userId") long userId);
+
+    @Delete("""
             DELETE FROM user_match_record
             WHERE user_id = #{userId}
               AND client_session_id = #{guestSessionId}
             """)
     int deleteGuestRecords(@Param("userId") long userId, @Param("guestSessionId") String guestSessionId);
+
+    @Delete("""
+            DELETE FROM user_match_record
+            WHERE user_id = #{userId}
+            """)
+    int deleteAllGuestRecords(@Param("userId") long userId);
 }

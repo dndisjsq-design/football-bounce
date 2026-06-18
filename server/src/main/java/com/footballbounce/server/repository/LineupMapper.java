@@ -3,6 +3,7 @@ package com.footballbounce.server.repository;
 import com.footballbounce.server.domain.PlayerData;
 import com.footballbounce.server.domain.UserLineup;
 import java.util.List;
+import org.apache.ibatis.annotations.Delete;
 import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
@@ -37,6 +38,14 @@ public interface LineupMapper {
             """)
     int insertOwnedPlayerIfAbsent(@Param("userId") Long userId, @Param("playerId") String playerId);
 
+    @Select("""
+            SELECT COUNT(*)
+            FROM user_owned_player
+            WHERE user_id = #{userId}
+              AND player_id = #{playerId}
+            """)
+    int countOwnedPlayer(@Param("userId") Long userId, @Param("playerId") String playerId);
+
     @Insert("""
             INSERT IGNORE INTO user_owned_player (user_id, player_id, created_at)
             SELECT #{userId}, player_id, NOW(6)
@@ -46,10 +55,25 @@ public interface LineupMapper {
     int insertOwnedPlayersByRarity(@Param("userId") Long userId, @Param("rarity") String rarity);
 
     @Insert("""
+            INSERT IGNORE INTO user_owned_player (user_id, player_id, created_at)
+            SELECT #{userId}, player_id, NOW(6)
+            FROM player_data
+            """)
+    int insertOwnedAllPlayers(@Param("userId") Long userId);
+
+    @Insert("""
             INSERT IGNORE INTO user_owned_formation (user_id, formation_id, sort_order, created_at)
             VALUES (#{userId}, #{formationId}, #{sortOrder}, NOW(6))
             """)
     int insertOwnedFormationIfAbsent(@Param("userId") Long userId, @Param("formationId") String formationId, @Param("sortOrder") Integer sortOrder);
+
+    @Select("""
+            SELECT COUNT(*)
+            FROM user_owned_formation
+            WHERE user_id = #{userId}
+              AND formation_id = #{formationId}
+            """)
+    int countOwnedFormation(@Param("userId") Long userId, @Param("formationId") String formationId);
 
     @Insert("""
             INSERT INTO user_lineup (
@@ -70,6 +94,24 @@ public interface LineupMapper {
             """)
     int upsertLineup(@Param("lineup") UserLineup lineup);
 
+    @Delete("""
+            DELETE FROM user_owned_player
+            WHERE user_id = #{userId}
+            """)
+    int deleteOwnedPlayers(@Param("userId") Long userId);
+
+    @Delete("""
+            DELETE FROM user_owned_formation
+            WHERE user_id = #{userId}
+            """)
+    int deleteOwnedFormations(@Param("userId") Long userId);
+
+    @Delete("""
+            DELETE FROM user_lineup
+            WHERE user_id = #{userId}
+            """)
+    int deleteLineup(@Param("userId") Long userId);
+
     @Select("""
             SELECT p.player_id AS playerId, p.name, p.score, p.rarity, p.avatar_seed AS avatarSeed,
                    p.intro, p.body_type AS bodyType, p.nationality, p.club, p.height, p.weight, p.age,
@@ -82,6 +124,18 @@ public interface LineupMapper {
                      p.player_id ASC
             """)
     List<PlayerData> findOwnedPlayers(@Param("userId") Long userId);
+
+    @Select("""
+            SELECT p.player_id
+            FROM user_owned_player up
+            INNER JOIN player_data p ON p.player_id = up.player_id
+            WHERE up.user_id = #{userId}
+            ORDER BY CASE p.rarity WHEN 'red' THEN 0 WHEN 'orange' THEN 1 WHEN 'purple' THEN 2 ELSE 3 END,
+                     p.score DESC,
+                     p.player_id ASC
+            LIMIT #{limit}
+            """)
+    List<String> findTopOwnedPlayerIds(@Param("userId") Long userId, @Param("limit") int limit);
 
     @Select("""
             SELECT p.player_id AS playerId, p.name, p.score, p.rarity, p.avatar_seed AS avatarSeed,

@@ -1,4 +1,5 @@
-import { AUTH_API_BASE_URL } from './AuthService';
+import { AUTH_API_BASE_URL, getCurrentUserId, postJson } from './AuthService';
+import type { UserSummary } from './AuthService';
 import type { PlayerRarity, RosterPlayer } from './PlayerRosterService';
 
 export interface ShopPlayerDetail extends RosterPlayer {
@@ -16,6 +17,25 @@ export interface ShopPlayerDetail extends RosterPlayer {
   curve: number;
   stamina: number;
   bodyStrength: number;
+}
+
+export interface ApiResponse<T> {
+  ok: boolean;
+  message: string;
+  data?: T;
+  userSummary?: UserSummary;
+}
+
+export interface PurchaseResult {
+  itemId: string;
+  price: number;
+}
+
+export interface DrawPackResult {
+  packId: string;
+  count: number;
+  price: number;
+  players: RosterPlayer[];
 }
 
 export function fetchShopPlayers(): Promise<RosterPlayer[]> {
@@ -69,6 +89,28 @@ export function fetchShopPlayerDetail(playerId: string): Promise<ShopPlayerDetai
     xhr.onerror = () => reject(new Error('无法连接球员详情服务器'));
     xhr.ontimeout = () => reject(new Error('连接球员详情服务器超时'));
     xhr.send();
+  });
+}
+
+export function purchasePlayer(playerId: string): Promise<ApiResponse<PurchaseResult>> {
+  return postJson<ApiResponse<PurchaseResult>>('/shop/purchase-player', {
+    userId: getCurrentUserId(),
+    playerId,
+  });
+}
+
+export function purchaseFormation(formationId: string): Promise<ApiResponse<PurchaseResult>> {
+  return postJson<ApiResponse<PurchaseResult>>('/shop/purchase-formation', {
+    userId: getCurrentUserId(),
+    formationId,
+  });
+}
+
+export function drawGachaPack(packId: string, count: 1 | 10): Promise<ApiResponse<DrawPackResult>> {
+  return postJson<ApiResponse<DrawPackResult>>('/shop/draw-pack', {
+    userId: getCurrentUserId(),
+    packId,
+    count,
   });
 }
 

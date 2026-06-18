@@ -16,6 +16,14 @@ public class UserAccount {
 
     private Integer coins;
 
+    private Integer singleTotalMatches;
+
+    private Integer singleWinMatches;
+
+    private Integer onlineTotalMatches;
+
+    private Integer onlineWinMatches;
+
     private LocalDateTime createdAt;
 
     private LocalDateTime updatedAt;
@@ -66,6 +74,38 @@ public class UserAccount {
 
     public void setCoins(Integer coins) {
         this.coins = coins;
+    }
+
+    public Integer getSingleTotalMatches() {
+        return singleTotalMatches;
+    }
+
+    public void setSingleTotalMatches(Integer singleTotalMatches) {
+        this.singleTotalMatches = singleTotalMatches;
+    }
+
+    public Integer getSingleWinMatches() {
+        return singleWinMatches;
+    }
+
+    public void setSingleWinMatches(Integer singleWinMatches) {
+        this.singleWinMatches = singleWinMatches;
+    }
+
+    public Integer getOnlineTotalMatches() {
+        return onlineTotalMatches;
+    }
+
+    public void setOnlineTotalMatches(Integer onlineTotalMatches) {
+        this.onlineTotalMatches = onlineTotalMatches;
+    }
+
+    public Integer getOnlineWinMatches() {
+        return onlineWinMatches;
+    }
+
+    public void setOnlineWinMatches(Integer onlineWinMatches) {
+        this.onlineWinMatches = onlineWinMatches;
     }
 
     public LocalDateTime getCreatedAt() {

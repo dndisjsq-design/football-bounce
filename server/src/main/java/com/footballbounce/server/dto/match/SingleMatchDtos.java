@@ -1,5 +1,6 @@
 package com.footballbounce.server.dto.match;
 
+import com.footballbounce.server.dto.UserSummaryDto;
 import java.util.List;
 
 public final class SingleMatchDtos {
@@ -166,7 +167,7 @@ public final class SingleMatchDtos {
     ) {
     }
 
-    public record FinishResponse(boolean ok, String message, SettlementDto settlement) {
+    public record FinishResponse(boolean ok, String message, SettlementDto settlement, UserSummaryDto userSummary) {
     }
 
     public record AbandonRequest(String matchId, Long userId) {

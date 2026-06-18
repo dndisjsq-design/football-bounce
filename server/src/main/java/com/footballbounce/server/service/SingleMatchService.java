@@ -2,6 +2,7 @@ package com.footballbounce.server.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.footballbounce.server.dto.UserSummaryDto;
 import com.footballbounce.server.dto.match.SingleMatchDtos.AbandonRequest;
 import com.footballbounce.server.dto.match.SingleMatchDtos.AbandonResponse;
 import com.footballbounce.server.dto.match.SingleMatchDtos.AiKeeperRequest;
@@ -81,12 +82,18 @@ public class SingleMatchService {
     );
 
     private final SingleMatchMapper mapper;
+    private final MatchRewardService matchRewardService;
     private final ObjectMapper objectMapper;
     private final Random random = new Random();
     private final Map<String, ServerMatchState> matches = new ConcurrentHashMap<>();
 
-    public SingleMatchService(SingleMatchMapper mapper, ObjectMapper objectMapper) {
+    public SingleMatchService(
+            SingleMatchMapper mapper,
+            MatchRewardService matchRewardService,
+            ObjectMapper objectMapper
+    ) {
         this.mapper = mapper;
+        this.matchRewardService = matchRewardService;
         this.objectMapper = objectMapper;
     }
 
@@ -267,16 +274,17 @@ public class SingleMatchService {
     public FinishResponse finish(FinishRequest request) {
         ServerMatchState state = matches.get(request.matchId());
         if (state == null) {
-            return new FinishResponse(false, "比赛不存在或已过期", null);
+            return new FinishResponse(false, "比赛不存在或已过期", null, null);
         }
         int duration = request.durationSeconds() == null ? 0 : Math.max(0, request.durationSeconds());
         String resultScore = request.resultScore() == null ? state.scoreHome + ":" + state.scoreAway : request.resultScore();
         String result = request.result() == null ? "" : request.result();
         SettlementDto settlement = state.settlement(result, resultScore);
         mapper.finishMatch(state.matchNo, state.userId, duration, settlement.scoreText(), result);
+        UserSummaryDto summary = recordMatchResult(state, result);
         recordAction(state, "server", null, "finish", request, true, "match finished");
         matches.remove(state.matchNo);
-        return new FinishResponse(true, "比赛结果已保存", settlement);
+        return new FinishResponse(true, "比赛结果已保存", settlement, summary);
     }
 
     @Transactional
@@ -294,6 +302,11 @@ public class SingleMatchService {
         mapper.deleteActionsByMatchNo(matchNo);
         mapper.deleteUnfinishedMatchRecord(matchNo, userId);
         return new AbandonResponse(true, "未完成比赛已删除");
+    }
+
+    private UserSummaryDto recordMatchResult(ServerMatchState state, String result) {
+        boolean win = "win".equalsIgnoreCase(result == null ? "" : result.trim());
+        return matchRewardService.recordSingleMatchResult(state.userId, state.matchNo, win);
     }
 
     private StartResponse startFailed(String message) {

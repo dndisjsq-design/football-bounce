@@ -93,6 +93,10 @@ public class UserService {
         user.setPasswordHash(passwordEncoder.encode(request.getPassword()));
         user.setDisplayName(username);
         user.setCoins(6000);
+        user.setSingleTotalMatches(0);
+        user.setSingleWinMatches(0);
+        user.setOnlineTotalMatches(0);
+        user.setOnlineWinMatches(0);
         userMapper.insert(user);
         lineupService.initializeNewUserDefaults(user.getId());
         return AuthResponse.success("注册成功", UserDto.from(user));

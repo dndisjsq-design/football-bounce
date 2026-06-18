@@ -4,6 +4,53 @@ CREATE DATABASE IF NOT EXISTS football_bounce
 
 USE football_bounce;
 
+CREATE TABLE IF NOT EXISTS guest_account_template (
+  template_key VARCHAR(32) NOT NULL,
+  username VARCHAR(64) NOT NULL,
+  display_name VARCHAR(64) NOT NULL,
+  avatar_url VARCHAR(255) NULL,
+  coins INT NOT NULL DEFAULT 100000,
+  player_policy VARCHAR(32) NOT NULL DEFAULT 'blue,purple',
+  formation_policy VARCHAR(32) NOT NULL DEFAULT 'default',
+  selected_formation_id VARCHAR(64) NOT NULL DEFAULT 'defense-311',
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (template_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO guest_account_template (
+  template_key,
+  username,
+  display_name,
+  avatar_url,
+  coins,
+  player_policy,
+  formation_policy,
+  selected_formation_id,
+  created_at,
+  updated_at
+) VALUES (
+  'default',
+  'visiter',
+  'visiter',
+  NULL,
+  100000,
+  'blue,purple',
+  'default',
+  'defense-311',
+  NOW(6),
+  NOW(6)
+)
+ON DUPLICATE KEY UPDATE
+  username = VALUES(username),
+  display_name = VALUES(display_name),
+  avatar_url = VALUES(avatar_url),
+  coins = VALUES(coins),
+  player_policy = VALUES(player_policy),
+  formation_policy = VALUES(formation_policy),
+  selected_formation_id = VALUES(selected_formation_id),
+  updated_at = NOW(6);
+
 CREATE TABLE IF NOT EXISTS user_account (
   id BIGINT NOT NULL AUTO_INCREMENT,
   username VARCHAR(64) NOT NULL,
@@ -11,11 +58,71 @@ CREATE TABLE IF NOT EXISTS user_account (
   display_name VARCHAR(64) NOT NULL,
   avatar_url VARCHAR(255) NULL,
   coins INT NOT NULL DEFAULT 6000,
+  single_total_matches INT NOT NULL DEFAULT 0,
+  single_win_matches INT NOT NULL DEFAULT 0,
+  online_total_matches INT NOT NULL DEFAULT 0,
+  online_win_matches INT NOT NULL DEFAULT 0,
   created_at DATETIME(6) NOT NULL,
   updated_at DATETIME(6) NOT NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uk_user_account_username (username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+SET @add_single_total_matches = (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE user_account ADD COLUMN single_total_matches INT NOT NULL DEFAULT 0 AFTER coins',
+    'SELECT 1'
+  )
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'user_account'
+    AND COLUMN_NAME = 'single_total_matches'
+);
+PREPARE stmt FROM @add_single_total_matches;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @add_single_win_matches = (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE user_account ADD COLUMN single_win_matches INT NOT NULL DEFAULT 0 AFTER single_total_matches',
+    'SELECT 1'
+  )
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'user_account'
+    AND COLUMN_NAME = 'single_win_matches'
+);
+PREPARE stmt FROM @add_single_win_matches;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @add_online_total_matches = (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE user_account ADD COLUMN online_total_matches INT NOT NULL DEFAULT 0 AFTER single_win_matches',
+    'SELECT 1'
+  )
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'user_account'
+    AND COLUMN_NAME = 'online_total_matches'
+);
+PREPARE stmt FROM @add_online_total_matches;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @add_online_win_matches = (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE user_account ADD COLUMN online_win_matches INT NOT NULL DEFAULT 0 AFTER online_total_matches',
+    'SELECT 1'
+  )
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'user_account'
+    AND COLUMN_NAME = 'online_win_matches'
+);
+PREPARE stmt FROM @add_online_win_matches;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 INSERT IGNORE INTO user_account (
   id,
@@ -24,18 +131,38 @@ INSERT IGNORE INTO user_account (
   display_name,
   avatar_url,
   coins,
+  single_total_matches,
+  single_win_matches,
+  online_total_matches,
+  online_win_matches,
   created_at,
   updated_at
 ) VALUES (
   1,
-  'guest',
+  'visiter',
   '$2a$10$7EqJtq98hPqEX7fNZaFWoOhi1H.FFyyUe.0gF5SZOMwQbW1pC8iSa',
-  '游客 10086',
+  'visiter',
   NULL,
   100000,
+  0,
+  0,
+  0,
+  0,
   NOW(6),
   NOW(6)
 );
+
+UPDATE user_account
+SET username = 'visiter',
+    display_name = 'visiter',
+    avatar_url = NULL,
+    coins = 100000,
+    single_total_matches = 0,
+    single_win_matches = 0,
+    online_total_matches = 0,
+    online_win_matches = 0,
+    updated_at = NOW(6)
+WHERE id = 1;
 
 CREATE TABLE IF NOT EXISTS user_login_session (
   id BIGINT NOT NULL AUTO_INCREMENT,
@@ -54,6 +181,7 @@ CREATE TABLE IF NOT EXISTS user_login_session (
     FOREIGN KEY (user_id) REFERENCES user_account (id)
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 
 CREATE TABLE IF NOT EXISTS player_data (
   player_id VARCHAR(64) NOT NULL,
@@ -133,6 +261,22 @@ CREATE TABLE IF NOT EXISTS user_owned_formation (
   created_at DATETIME(6) NOT NULL,
   PRIMARY KEY (user_id, formation_id),
   CONSTRAINT fk_user_owned_formation_user
+    FOREIGN KEY (user_id) REFERENCES user_account (id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS coin_transaction (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  user_id BIGINT NOT NULL,
+  change_amount INT NOT NULL,
+  balance_after INT NOT NULL,
+  reason VARCHAR(64) NOT NULL,
+  related_id VARCHAR(128) NULL,
+  created_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_coin_transaction_user_time (user_id, created_at),
+  KEY idx_coin_transaction_reason (reason),
+  CONSTRAINT fk_coin_transaction_user
     FOREIGN KEY (user_id) REFERENCES user_account (id)
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

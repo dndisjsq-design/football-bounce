@@ -405,13 +405,10 @@ export class EditableMatch {
       const lineupPlayer = lineup[playerSlotIndex(p.id)] || null;
       if (node) {
         node.active = true;
-        const fill = p.side === 'home'
-          ? (lineupPlayer ? matchRarityColor(lineupPlayer.rarity) : rgba(238, 77, 77))
-          : rgba(74, 135, 232);
         drawDiscNode(
           node,
           p.radius,
-          fill,
+          matchTeamDiscColor(p.side),
           rgba(255, 255, 255, 215),
           '',
           p.side,
@@ -988,8 +985,9 @@ export class EditableMatch {
 
   private matchDisplayName(): string {
     const name = getCurrentUserDisplayName();
-    return name === '游客 10086' || name.toLowerCase() === 'guest' ? '游客' : name;
+    return name;
   }
+
 
   private updateGoalCelebration(dt: number): void {
     if (this.goalCelebrationRemaining <= 0) return;
@@ -2100,6 +2098,7 @@ export class EditableMatch {
     return side === 'home' ? getLineupPlayers() : [];
   }
 
+
   private hideRuntimeMatchObjects(): void {
     for (let index = 1; index <= 5; index += 1) {
       const home = findNode(this.canvas, `Player_home-${index}`);
@@ -2587,11 +2586,8 @@ function playerSlotIndex(id: string): number {
   return Number.isFinite(value) ? value - 1 : 0;
 }
 
-function matchRarityColor(rarity: RosterPlayer['rarity']): Color {
-  if (rarity === 'red') return rgba(190, 42, 51);
-  if (rarity === 'orange') return rgba(205, 111, 27);
-  if (rarity === 'purple') return rgba(111, 65, 185);
-  return rgba(45, 107, 188);
+function matchTeamDiscColor(side: TeamSide): Color {
+  return side === 'home' ? rgba(238, 77, 77) : rgba(74, 135, 232);
 }
 
 function drawMatchAvatar(g: Graphics, x: number, y: number, radius: number, player: RosterPlayer): void {

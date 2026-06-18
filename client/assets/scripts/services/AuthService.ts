@@ -10,14 +10,22 @@ export type AuthCode = 'SUCCESS' | 'WRONG_PASSWORD' | 'USER_NOT_FOUND' | 'USERNA
 export interface AuthResponse {
   code: AuthCode;
   message: string;
-  user?: {
-    id: number;
-    username: string;
-    displayName: string;
-    coins?: number;
-  };
+  user?: UserSummary;
+  userSummary?: UserSummary;
   authToken?: string;
   expiresAt?: string;
+}
+
+export interface UserSummary {
+  id: number;
+  username: string;
+  displayName: string;
+  avatarUrl?: string | null;
+  coins?: number;
+  singleTotalMatches?: number;
+  singleWinMatches?: number;
+  onlineTotalMatches?: number;
+  onlineWinMatches?: number;
 }
 
 const DEVICE_ID_KEY = 'footballBounce.deviceId';
@@ -25,7 +33,11 @@ const AUTH_TOKEN_KEY = 'footballBounce.authToken';
 const AUTH_USER_KEY = 'footballBounce.authUser';
 const AUTH_EXPIRES_AT_KEY = 'footballBounce.authExpiresAt';
 const GUEST_USER_ID = 1;
+const GUEST_USERNAME = 'visiter';
+const GUEST_DISPLAY_NAME = 'visiter';
+const GUEST_DEFAULT_COINS = 100000;
 const GUEST_SESSION_ID_KEY = 'footballBounce.guestSessionId';
+const userSummaryListeners: Array<(summary: UserSummary) => void> = [];
 
 function resolveApiBaseUrl(): string {
   const browserLocation = (globalThis as { location?: { protocol?: string; hostname?: string } }).location;
@@ -48,7 +60,7 @@ export function authMessage(response: AuthResponse): string {
 export function loginWithPassword(username: string, password: string): Promise<AuthResponse> {
   const previousGuestSessionId = getCurrentGuestSessionId();
   return postAuth('/auth/login', { username, password, deviceId: getOrCreateDeviceId() }).then((response) => {
-    if (response.code === 'SUCCESS' && previousGuestSessionId) clearGuestMatchRecords(previousGuestSessionId);
+    if (response.code === 'SUCCESS' && previousGuestSessionId) resetGuestAccount(previousGuestSessionId);
     saveAuthSession(response);
     return response;
   });
@@ -61,13 +73,16 @@ export function registerAccount(username: string, password: string): Promise<Aut
 export function loginAsGuest(): void {
   sys.localStorage.removeItem(AUTH_TOKEN_KEY);
   sys.localStorage.removeItem(AUTH_EXPIRES_AT_KEY);
-  sys.localStorage.setItem(AUTH_USER_KEY, JSON.stringify({
+  applyUserSummary({
     id: GUEST_USER_ID,
-    username: 'guest',
-    displayName: '游客 10086',
-    coins: 100000,
-  }));
-  setCurrentCoins(100000);
+    username: GUEST_USERNAME,
+    displayName: GUEST_DISPLAY_NAME,
+    coins: GUEST_DEFAULT_COINS,
+    singleTotalMatches: 0,
+    singleWinMatches: 0,
+    onlineTotalMatches: 0,
+    onlineWinMatches: 0,
+  });
 }
 
 export function tryAutoLogin(): Promise<AuthResponse | null> {
@@ -89,7 +104,7 @@ export function logoutCurrentDevice(): void {
   const authToken = sys.localStorage.getItem(AUTH_TOKEN_KEY) || '';
   const deviceId = getOrCreateDeviceId();
   clearAuthSession();
-  if (guest && guestSessionId) clearGuestMatchRecords(guestSessionId);
+  if (guest) resetGuestAccount(guestSessionId);
   if (!authToken) return;
   void postAuth('/auth/logout', { deviceId, authToken }).catch(() => {
     // Local logout should succeed even when the server is temporarily unreachable.
@@ -98,31 +113,53 @@ export function logoutCurrentDevice(): void {
 
 export function startGuestLogin(): void {
   const previousGuestSessionId = getCurrentGuestSessionId();
-  if (previousGuestSessionId) clearGuestMatchRecords(previousGuestSessionId);
+  resetGuestAccount(previousGuestSessionId);
   loginAsGuest();
   sys.localStorage.setItem(GUEST_SESSION_ID_KEY, `guest-${Date.now().toString(36)}-${randomHex(12)}`);
 }
 
 export function getCurrentUserDisplayName(): string {
-  const saved = sys.localStorage.getItem(AUTH_USER_KEY);
-  if (!saved) return '游客 10086';
-  try {
-    const user = JSON.parse(saved) as { username?: string; displayName?: string };
-    return user.displayName || user.username || '游客 10086';
-  } catch {
-    return '游客 10086';
-  }
+  const user = getCurrentUserSummary();
+  return user.displayName || user.username || GUEST_DISPLAY_NAME;
 }
 
 export function getCurrentUserId(): number {
+  const user = getCurrentUserSummary();
+  return Number.isFinite(user.id) && user.id > 0 ? user.id : GUEST_USER_ID;
+}
+
+export function getCurrentUserSummary(): UserSummary {
   const saved = sys.localStorage.getItem(AUTH_USER_KEY);
-  if (!saved) return GUEST_USER_ID;
+  if (!saved) return guestSummary();
   try {
-    const user = JSON.parse(saved) as { id?: number };
-    return Number.isFinite(user.id) && user.id! > 0 ? user.id! : GUEST_USER_ID;
+    const user = JSON.parse(saved) as Partial<UserSummary>;
+    return normalizeUserSummary(user);
   } catch {
-    return GUEST_USER_ID;
+    return guestSummary();
   }
+}
+
+export function onUserSummaryChange(listener: (summary: UserSummary) => void): () => void {
+  userSummaryListeners.push(listener);
+  return () => {
+    const index = userSummaryListeners.indexOf(listener);
+    if (index >= 0) userSummaryListeners.splice(index, 1);
+  };
+}
+
+export function applyUserSummary(summary: Partial<UserSummary> | null | undefined): void {
+  if (!summary) return;
+  const previous = getCurrentUserSummary();
+  const next = normalizeUserSummary({ ...previous, ...summary });
+  sys.localStorage.setItem(AUTH_USER_KEY, JSON.stringify(next));
+  if (typeof next.coins === 'number') setCurrentCoins(next.coins);
+  for (const listener of userSummaryListeners.slice()) listener(next);
+}
+
+export function applyApiUserSummary(response: unknown): void {
+  if (!response || typeof response !== 'object') return;
+  const maybe = response as { userSummary?: Partial<UserSummary>; user?: Partial<UserSummary> };
+  if (maybe.userSummary) applyUserSummary(maybe.userSummary);
 }
 
 export function getCurrentGuestSessionId(): string {
@@ -143,10 +180,39 @@ export function clearAuthSession(): void {
 function saveAuthSession(response: AuthResponse): void {
   if (response.code !== 'SUCCESS') return;
   sys.localStorage.removeItem(GUEST_SESSION_ID_KEY);
-  if (response.user) sys.localStorage.setItem(AUTH_USER_KEY, JSON.stringify(response.user));
-  if (typeof response.user?.coins === 'number') setCurrentCoins(response.user.coins);
+  applyUserSummary(response.user || response.userSummary);
   if (response.authToken) sys.localStorage.setItem(AUTH_TOKEN_KEY, response.authToken);
   if (response.expiresAt) sys.localStorage.setItem(AUTH_EXPIRES_AT_KEY, response.expiresAt);
+}
+
+function normalizeUserSummary(user: Partial<UserSummary>): UserSummary {
+  const id = typeof user.id === 'number' && Number.isFinite(user.id) && user.id > 0 ? user.id : GUEST_USER_ID;
+  const username = typeof user.username === 'string' && user.username.trim() ? user.username.trim() : (id === GUEST_USER_ID ? GUEST_USERNAME : '');
+  const displayName = typeof user.displayName === 'string' && user.displayName.trim() ? user.displayName.trim() : (username || GUEST_DISPLAY_NAME);
+  const coins = typeof user.coins === 'number' && Number.isFinite(user.coins) ? Math.max(0, Math.floor(user.coins)) : undefined;
+  const avatarUrl = typeof user.avatarUrl === 'string' ? user.avatarUrl : user.avatarUrl === null ? null : undefined;
+  const singleTotalMatches = normalizeCounter(user.singleTotalMatches);
+  const singleWinMatches = normalizeCounter(user.singleWinMatches);
+  const onlineTotalMatches = normalizeCounter(user.onlineTotalMatches);
+  const onlineWinMatches = normalizeCounter(user.onlineWinMatches);
+  return { id, username, displayName, avatarUrl, coins, singleTotalMatches, singleWinMatches, onlineTotalMatches, onlineWinMatches };
+}
+
+function guestSummary(): UserSummary {
+  return {
+    id: GUEST_USER_ID,
+    username: GUEST_USERNAME,
+    displayName: GUEST_DISPLAY_NAME,
+    coins: GUEST_DEFAULT_COINS,
+    singleTotalMatches: 0,
+    singleWinMatches: 0,
+    onlineTotalMatches: 0,
+    onlineWinMatches: 0,
+  };
+}
+
+function normalizeCounter(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : undefined;
 }
 
 function getOrCreateDeviceId(): string {
@@ -175,12 +241,12 @@ export function postAuth(path: string, body: Record<string, string>): Promise<Au
   return postJson<AuthResponse>(path, body);
 }
 
-function clearGuestMatchRecords(guestSessionId: string): void {
-  void postJson('/match-records/guest-session/clear', {
+function resetGuestAccount(guestSessionId: string): void {
+  void postJson('/auth/guest/reset', {
     userId: 1,
     guestSessionId,
   }).catch(() => {
-    // Guest cleanup is best-effort; a new guest session id still isolates future queries.
+    // Guest reset is best-effort; the backend will still be authoritative after it reconnects.
   });
 }
 
@@ -199,6 +265,7 @@ export function postJson<T>(path: string, body: unknown, timeoutMs = 8000): Prom
         parsed = null;
       }
       if (xhr.status >= 200 && xhr.status < 300 && parsed) {
+        applyApiUserSummary(parsed);
         resolve(parsed);
         return;
       }

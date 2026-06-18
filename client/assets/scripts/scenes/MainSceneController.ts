@@ -1,18 +1,19 @@
 import { Color, director, EventTouch, Graphics, Label, Mask, MaskType, Node, Sprite, UITransform } from 'cc';
 import { MatchMode } from '../MatchTypes';
-import { getCurrentUserDisplayName, logoutCurrentDevice } from '../services/AuthService';
+import { getCurrentUserSummary, logoutCurrentDevice, onUserSummaryChange } from '../services/AuthService';
+import type { UserSummary } from '../services/AuthService';
 import { MatchRecordSummary, fetchRecentMatchRecords, setSelectedReplayMatchId } from '../services/MatchRecordService';
+import { getCurrentCoins } from '../services/WalletService';
 import { findNode, onTap, rgba } from '../utils/CocosNodeUtils';
+
+const HEADER_COIN_X = 108;
+const HEADER_COIN_Y = 393;
 
 export function bindHomeScene(root: Node, selectMatchMode: (mode: MatchMode) => void): void {
   bindTabs(root, 'home');
   bindMatchRecordButton(root);
   onTap(root, 'ButtonAI', () => {
     selectMatchMode('ai');
-    director.loadScene('Match');
-  });
-  onTap(root, 'ButtonOnline', () => {
-    selectMatchMode('online');
     director.loadScene('Match');
   });
 }
@@ -34,9 +35,20 @@ export function bindTabs(root: Node, active: string): void {
 }
 
 function bindTopProfile(root: Node): void {
-  const name = getCurrentUserDisplayName();
+  hideBrandTitle(root);
+  const summary = getCurrentUserSummary();
   const nameLabel = findNode(root, 'TextAccount')?.getComponent(Label);
-  if (nameLabel) nameLabel.string = name;
+  if (nameLabel) nameLabel.string = displayName(summary);
+  bindHeaderCoins(root, summary);
+  const unsubscribe = onUserSummaryChange((next) => {
+    if (!root.isValid) {
+      unsubscribe();
+      return;
+    }
+    const currentNameLabel = findNode(root, 'TextAccount')?.getComponent(Label);
+    if (currentNameLabel) currentNameLabel.string = displayName(next);
+    bindHeaderCoins(root, next);
+  });
   const avatar = findNode(root, 'TopAvatar');
   if (!avatar) return;
   const sprite = avatar.getComponent(Sprite);
@@ -52,13 +64,53 @@ function bindTopProfile(root: Node): void {
   g.stroke();
 }
 
+function displayName(summary: UserSummary): string {
+  return summary.displayName || summary.username || 'visiter';
+}
+
+function hideBrandTitle(root: Node): void {
+  for (const name of ['TextBrandShadow', 'TextGameTitle']) {
+    const node = findNode(root, name);
+    if (!node) continue;
+    const label = node.getComponent(Label);
+    if (label) label.string = '';
+    node.active = false;
+  }
+}
+
+function bindHeaderCoins(root: Node, summary = getCurrentUserSummary()): void {
+  const node = findNode(root, 'TextCoins') || findNode(root, 'TextShopCoins') || createHeaderCoinNode(root);
+  node.active = true;
+  node.setPosition(HEADER_COIN_X, HEADER_COIN_Y);
+  const transform = node.getComponent(UITransform) || node.addComponent(UITransform);
+  transform.setContentSize(150, 34);
+  const label = node.getComponent(Label) || node.addComponent(Label);
+  label.string = `金币 ${typeof summary.coins === 'number' ? summary.coins : getCurrentCoins()}`;
+  label.fontSize = 17;
+  label.lineHeight = 23;
+  label.isBold = true;
+  label.cacheMode = Label.CacheMode.NONE;
+  label.horizontalAlign = Label.HorizontalAlign.CENTER;
+  label.verticalAlign = Label.VerticalAlign.CENTER;
+  label.overflow = Label.Overflow.SHRINK;
+  label.enableWrapText = false;
+  label.color = rgba(255, 237, 96);
+}
+
+function createHeaderCoinNode(root: Node): Node {
+  const node = new Node('TextHeaderCoinsRuntime');
+  node.layer = root.layer;
+  root.addChild(node);
+  return node;
+}
+
 function bindMatchRecordButton(root: Node): void {
   const old = findNode(root, 'ButtonMatchRecordsRuntime');
   if (old) old.destroy();
   const button = new Node('ButtonMatchRecordsRuntime');
   button.layer = root.layer;
   root.addChild(button);
-  button.setPosition(162, 360);
+  button.setPosition(162, 318);
   button.addComponent(UITransform).setContentSize(42, 42);
   const g = button.addComponent(Graphics);
   drawRecordBookIcon(g, 0, 0, 34, 34);
@@ -244,7 +296,7 @@ function resultColor(result: string): Color {
 }
 
 function displayGuestName(name: string): string {
-  return name === '游客 10086' || name.toLowerCase() === 'guest' ? '游客' : name;
+  return name;
 }
 
 function createRuntimeLabel(parent: Node, name: string, text: string, x: number, y: number, fontSize: number, color: Color, align: number, width: number, height: number): Label {

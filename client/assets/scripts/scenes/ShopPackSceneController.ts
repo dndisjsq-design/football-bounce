@@ -1,6 +1,6 @@
 import { AudioClip, AudioSource, Color, EventTouch, Graphics, Label, Mask, MaskType, Node, Sprite, UIOpacity, UITransform, Vec3, director, resources, tween } from 'cc';
 import { PlayerRarity, RosterPlayer } from '../services/PlayerRosterService';
-import { fetchShopPlayers } from '../services/ShopCatalogApiService';
+import { drawGachaPack, fetchShopPlayers } from '../services/ShopCatalogApiService';
 import { getCurrentCoins } from '../services/WalletService';
 import { renderStandardPlayerCard } from '../ui/PlayerCardView';
 import { findNode, rgba } from '../utils/CocosNodeUtils';
@@ -114,10 +114,12 @@ class ShopPackScene {
 
   private startDrawFlow(pack: PackMeta, count: number): void {
     this.setLoadingState('请求抽球...');
-    void this.buildFreshPack(pack).then((freshPack) => {
+    const drawCount: 1 | 10 = count === 10 ? 10 : 1;
+    void Promise.all([this.buildFreshPack(pack), drawGachaPack(pack.id, drawCount)]).then(([freshPack, response]) => {
       this.setLoadingState('');
-      if (freshPack.players.length === 0) return;
-      const results = Array.from({ length: count }, () => drawFromPack(freshPack));
+      if (!response.ok) throw new Error(response.message || '抽球失败');
+      const results = response.data?.players || [];
+      if (freshPack.players.length === 0 || results.length === 0) return;
       findNode(this.root, 'PackContentsOverlay')?.destroy();
       this.showDrawAnimation(freshPack, results);
     }).catch((error: Error) => {
@@ -258,13 +260,6 @@ function topDistributedGroup(players: RosterPlayer[], packIndex: number): Roster
 function cyclicSlice<T>(items: T[], start: number, count: number): T[] {
   if (!items.length) return [];
   return Array.from({ length: count }, (_, index) => items[(start + index) % items.length]);
-}
-
-function drawFromPack(pack: GachaPack): RosterPlayer {
-  const roll = Math.random();
-  const rarity: PlayerRarity = roll < 0.5 ? 'red' : roll < 0.6 ? 'orange' : roll < 0.8 ? 'purple' : 'blue';
-  const pool = pack.players.filter((player) => player.rarity === rarity);
-  return pool[Math.floor(Math.random() * pool.length)] || pack.players[0];
 }
 
 function highestRarity(players: RosterPlayer[]): PlayerRarity {

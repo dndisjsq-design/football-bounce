@@ -1,7 +1,7 @@
 import { Color, EventTouch, Graphics, Label, Mask, MaskType, Node, Sprite, UITransform, director } from 'cc';
 import { FormationDefinition, getPreviewFormationPoints, getShopFormations } from '../services/FormationService';
 import { PlayerRarity, RosterPlayer } from '../services/PlayerRosterService';
-import { ShopPlayerDetail, fetchShopPlayerDetail, fetchShopPlayers } from '../services/ShopCatalogApiService';
+import { ShopPlayerDetail, fetchShopPlayerDetail, fetchShopPlayers, purchaseFormation, purchasePlayer } from '../services/ShopCatalogApiService';
 import { getCurrentCoins } from '../services/WalletService';
 import { drawPlayerAvatar, renderPricedPlayerCard } from '../ui/PlayerCardView';
 import { findNode, onTap, rgba } from '../utils/CocosNodeUtils';
@@ -389,7 +389,10 @@ export function showPlayerDetail(root: Node, player: RosterPlayer, options: Play
   if (showPurchase) {
     const buyButton = createDetailButton(panel, 'PlayerDetailBuy', '购买', 86, -322, 112, 42, rgba(255, 128, 31), () => {
       if (!loadedDetail) return;
-      showPurchaseConfirm(overlay, loadedDetail.name, loadedDetail.price);
+      showPurchaseConfirm(overlay, loadedDetail.name, loadedDetail.price, () => purchasePlayer(loadedDetail!.id).then((response) => {
+        if (!response.ok) throw new Error(response.message || '购买失败');
+        return response.message || '购买成功';
+      }));
     });
     buyButton.active = false;
     void fetchShopPlayerDetail(player.id).then((detail) => {
@@ -481,7 +484,10 @@ function showFormationDetail(root: Node, formation: FormationDefinition): void {
 
   createDetailButton(panel, 'FormationDetailClose', '关闭', -86, -322, 112, 42, rgba(84, 102, 132), () => overlay.destroy());
   createDetailButton(panel, 'FormationDetailBuy', '购买', 86, -322, 112, 42, rgba(255, 128, 31), () => {
-    showPurchaseConfirm(overlay, formation.name, price);
+    showPurchaseConfirm(overlay, formation.name, price, () => purchaseFormation(formation.id).then((response) => {
+      if (!response.ok) throw new Error(response.message || '购买失败');
+      return response.message || '购买成功';
+    }));
   });
 }
 
@@ -627,7 +633,7 @@ function drawDetailButton(g: Graphics, width: number, height: number, color: Col
   g.stroke();
 }
 
-function showPurchaseConfirm(overlay: Node, itemName: string, price: number): void {
+function showPurchaseConfirm(overlay: Node, itemName: string, price: number, onConfirm: () => Promise<string>): void {
   findNode(overlay, 'PurchaseConfirm')?.destroy();
   const shade = createUiNode(overlay, 'PurchaseConfirm', 0, 0, 390, 844);
   const shadeGraphics = shade.addComponent(Graphics);
@@ -636,10 +642,20 @@ function showPurchaseConfirm(overlay: Node, itemName: string, price: number): vo
   shadeGraphics.fill();
   const panel = createPanel(shade, 'PurchaseConfirmPanel', 0, 0, 304, 206);
   createDetailLabel(panel, 'PurchaseConfirmTitle', '确认购买', 0, 66, 22, 240, 34, rgba(255, 246, 130), true);
-  createDetailLabel(panel, 'PurchaseConfirmText', `${itemName}\n价格 ${price}`, 0, 18, 16, 240, 60, rgba(245, 249, 255), true, Label.HorizontalAlign.CENTER, true);
+  const message = createDetailLabel(panel, 'PurchaseConfirmText', `${itemName}\n价格 ${price}`, 0, 18, 16, 240, 60, rgba(245, 249, 255), true, Label.HorizontalAlign.CENTER, true);
   createDetailButton(panel, 'PurchaseCancel', '取消', -70, -68, 104, 40, rgba(84, 102, 132), () => shade.destroy());
+  let pending = false;
   createDetailButton(panel, 'PurchaseConfirmButton', '确认', 70, -68, 104, 40, rgba(255, 128, 31), () => {
-    shade.destroy();
+    if (pending) return;
+    pending = true;
+    message.string = '购买中...';
+    onConfirm().then((text) => {
+      message.string = text;
+      shade.destroy();
+    }).catch((error: Error) => {
+      pending = false;
+      message.string = error.message || '购买失败';
+    });
   });
 }
 
