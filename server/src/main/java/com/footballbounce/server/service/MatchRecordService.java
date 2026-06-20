@@ -1,5 +1,7 @@
 package com.footballbounce.server.service;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.footballbounce.server.dto.match.MatchRecordDtos.GuestSessionClearRequest;
 import com.footballbounce.server.dto.match.MatchRecordDtos.GuestSessionClearResponse;
 import com.footballbounce.server.dto.match.MatchRecordDtos.MatchActionDto;
@@ -23,9 +25,11 @@ public class MatchRecordService {
     private static final long GUEST_USER_ID = 1L;
 
     private final MatchRecordMapper mapper;
+    private final ObjectMapper objectMapper;
 
-    public MatchRecordService(MatchRecordMapper mapper) {
+    public MatchRecordService(MatchRecordMapper mapper, ObjectMapper objectMapper) {
         this.mapper = mapper;
+        this.objectMapper = objectMapper;
     }
 
     public RecentResponse recent(RecentRequest request) {
@@ -58,13 +62,16 @@ public class MatchRecordService {
             return new ReplayResponse(false, "未查询到该场已完成比赛", null, List.of(), List.of(), List.of());
         }
         MatchRecordSummary record = recordSummary(row);
-        List<PlayerSummary> homeLineup = loadLineup(record.homeLineupPlayerIds());
-        List<PlayerSummary> awayLineup = loadLineup(record.awayLineupPlayerIds());
+        boolean mirrorForAway = "online".equals(record.matchType()) && "away".equals(record.userSide());
+        MatchRecordSummary replayRecord = mirrorForAway ? mirrorRecord(record) : record;
+        List<PlayerSummary> homeLineup = loadLineup(replayRecord.homeLineupPlayerIds());
+        List<PlayerSummary> awayLineup = loadLineup(replayRecord.awayLineupPlayerIds());
         List<MatchActionDto> actions = mapper.findActions(record.matchId())
                 .stream()
                 .map(MatchRecordService::actionDto)
+                .map(action -> mirrorForAway ? mirrorAction(action) : action)
                 .toList();
-        return new ReplayResponse(true, "查询成功", record, homeLineup, awayLineup, actions);
+        return new ReplayResponse(true, "查询成功", replayRecord, homeLineup, awayLineup, actions);
     }
 
     @Transactional
@@ -74,10 +81,98 @@ public class MatchRecordService {
         if (userId != GUEST_USER_ID || guestSessionId.isBlank()) {
             return new GuestSessionClearResponse(true, "没有需要清理的游客记录");
         }
-        mapper.deleteGuestGoals(userId, guestSessionId);
-        mapper.deleteGuestActions(userId, guestSessionId);
-        int deleted = mapper.deleteGuestRecords(userId, guestSessionId);
-        return new GuestSessionClearResponse(true, "已清理游客比赛记录 " + deleted + " 条");
+        return new GuestSessionClearResponse(true, "游客比赛记录已保留");
+    }
+
+    private MatchRecordSummary mirrorRecord(MatchRecordSummary record) {
+        return new MatchRecordSummary(
+                record.matchId(),
+                record.matchTime(),
+                record.matchType(),
+                record.durationSeconds(),
+                record.userId(),
+                record.username(),
+                "home",
+                record.opponentUserId(),
+                record.opponentUsername(),
+                record.resultScore(),
+                record.result(),
+                record.awayFormationId(),
+                record.homeFormationId(),
+                record.awayLineupPlayerIds(),
+                record.homeLineupPlayerIds()
+        );
+    }
+
+    private MatchActionDto mirrorAction(MatchActionDto action) {
+        return new MatchActionDto(
+                action.actionIndex(),
+                action.actorUserId(),
+                mirrorSide(action.actorSide()),
+                mirrorPlayerId(action.actorId()),
+                action.actionType(),
+                mirrorCommandJson(action.commandJson()),
+                action.validResult(),
+                action.validationMessage(),
+                action.createdAt()
+        );
+    }
+
+    private String mirrorCommandJson(String commandJson) {
+        if (commandJson == null || commandJson.isBlank()) {
+            return commandJson;
+        }
+        try {
+            Map<String, Object> payload = objectMapper.readValue(commandJson, new TypeReference<Map<String, Object>>() {});
+            Object actorId = payload.get("actorId");
+            if (actorId instanceof String actorText) {
+                payload.put("actorId", mirrorPlayerId(actorText));
+            }
+            Object side = payload.get("side");
+            if (side instanceof String sideText) {
+                payload.put("side", mirrorSide(sideText));
+            }
+            Object angle = payload.get("angleRad");
+            if (angle instanceof Number number) {
+                payload.put("angleRad", rotateHalfTurnAngle(number.doubleValue()));
+            }
+            Object score = payload.get("score");
+            if (score instanceof Map<?, ?> scoreMap) {
+                Object home = scoreMap.get("home");
+                Object away = scoreMap.get("away");
+                Map<String, Object> mirroredScore = new HashMap<>();
+                mirroredScore.put("home", away);
+                mirroredScore.put("away", home);
+                payload.put("score", mirroredScore);
+            }
+            return objectMapper.writeValueAsString(payload);
+        } catch (Exception ignored) {
+            return commandJson;
+        }
+    }
+
+    private static String mirrorSide(String side) {
+        if ("home".equals(side)) return "away";
+        if ("away".equals(side)) return "home";
+        return side;
+    }
+
+    private static String mirrorPlayerId(String id) {
+        String value = id == null ? "" : id.trim();
+        if (value.startsWith("home-")) return "away-" + value.substring("home-".length());
+        if (value.startsWith("away-")) return "home-" + value.substring("away-".length());
+        return value;
+    }
+
+    private static double normalizeAngle(double angle) {
+        double value = angle;
+        while (value > Math.PI) value -= Math.PI * 2;
+        while (value < -Math.PI) value += Math.PI * 2;
+        return value;
+    }
+
+    private static double rotateHalfTurnAngle(double angle) {
+        return normalizeAngle(angle + Math.PI);
     }
 
     private List<PlayerSummary> loadLineup(String idsText) {

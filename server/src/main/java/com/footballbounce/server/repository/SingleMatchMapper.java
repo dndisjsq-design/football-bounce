@@ -206,6 +206,57 @@ public interface SingleMatchMapper {
     );
 
     @Select("""
+            <script>
+            SELECT match_no AS matchId,
+                   match_type AS matchType,
+                   duration_seconds AS durationSeconds,
+                   user_id AS userId,
+                   username,
+                   user_side AS userSide,
+                   opponent_user_id AS opponentUserId,
+                   opponent_username AS opponentUsername,
+                   result_score AS resultScore,
+                   result,
+                   home_formation_id AS homeFormationId,
+                   away_formation_id AS awayFormationId,
+                   home_lineup_player_ids AS homeLineupPlayerIds,
+                   away_lineup_player_ids AS awayLineupPlayerIds
+            FROM user_match_record
+            WHERE match_no = #{matchNo}
+              AND user_id = #{userId}
+              AND match_type = 'online'
+              AND result IS NOT NULL
+              <if test="guestOnly">
+                AND client_session_id = #{guestSessionId}
+              </if>
+            LIMIT 1
+            </script>
+            """)
+    Map<String, Object> findOnlineFinishedRecord(
+            @Param("matchNo") String matchNo,
+            @Param("userId") Long userId,
+            @Param("guestOnly") boolean guestOnly,
+            @Param("guestSessionId") String guestSessionId
+    );
+
+    @Select("""
+            SELECT match_second AS matchSecond,
+                   is_penalty AS penalty,
+                   user_id AS userId,
+                   username,
+                   side,
+                   actor_id AS actorId,
+                   player_id AS playerId,
+                   player_name AS playerName,
+                   is_own_goal AS ownGoal,
+                   goal_order AS goalOrder
+            FROM match_goal_record
+            WHERE match_no = #{matchNo}
+            ORDER BY match_second ASC, goal_order ASC
+            """)
+    List<Map<String, Object>> findGoalsByMatchNo(@Param("matchNo") String matchNo);
+
+    @Select("""
             SELECT COUNT(1)
             FROM user_match_record
             WHERE match_no = #{matchNo}

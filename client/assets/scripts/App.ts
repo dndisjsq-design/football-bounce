@@ -15,7 +15,8 @@ import { bindShopPackScene } from './scenes/ShopPackSceneController';
 import { bindShopFormationScene, bindShopHomeScene, bindShopPlayerScene } from './scenes/ShopSceneController';
 import { consumeSelectedReplayMatchId } from './services/MatchRecordService';
 import { MusicManager } from './services/MusicManager';
-import { cleanTextRenderers, ensureCameraClearsFrame, onTap } from './utils/CocosNodeUtils';
+import { consumeSelectedOnlineMatch } from './services/OnlineMatchService';
+import { cleanTextRenderers, ensureCameraClearsFrame, findNode, onTap } from './utils/CocosNodeUtils';
 
 const { ccclass } = _decorator;
 
@@ -58,14 +59,21 @@ export class App extends Component {
   }
 
   private bindMatch(): void {
-    onTap(this.node, 'ButtonBackHome', () => {
-      this.match?.dispose();
-      this.match = null;
-      director.loadScene('Home');
-    });
     const replayMatchId = consumeSelectedReplayMatchId();
-    const transport = selectedMatchMode === 'online' && !replayMatchId ? new OnlineMatchTransport() : new LocalMatchTransport();
-    this.match = new EditableMatch(this.node, replayMatchId ? 'ai' : selectedMatchMode, transport, replayMatchId);
+    const onlineMatch = selectedMatchMode === 'online' && !replayMatchId ? consumeSelectedOnlineMatch() : null;
+    const lockedOnlineMatch = selectedMatchMode === 'online' && !replayMatchId;
+    const backButton = findNode(this.node, 'ButtonBackHome');
+    if (lockedOnlineMatch) {
+      if (backButton) backButton.active = false;
+    } else {
+      onTap(this.node, 'ButtonBackHome', () => {
+        this.match?.dispose();
+        this.match = null;
+        director.loadScene('Home');
+      });
+    }
+    const transport = selectedMatchMode === 'online' && !replayMatchId ? new OnlineMatchTransport(onlineMatch) : new LocalMatchTransport();
+    this.match = new EditableMatch(this.node, replayMatchId ? 'ai' : selectedMatchMode, transport, replayMatchId, onlineMatch);
     this.match.start();
   }
 }

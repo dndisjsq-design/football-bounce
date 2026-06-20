@@ -5,7 +5,6 @@ import com.footballbounce.server.dto.ApiResponse;
 import com.footballbounce.server.dto.GuestResetRequest;
 import com.footballbounce.server.repository.CoinTransactionMapper;
 import com.footballbounce.server.repository.LineupMapper;
-import com.footballbounce.server.repository.MatchRecordMapper;
 import com.footballbounce.server.repository.UserMapper;
 import java.util.List;
 import java.util.Locale;
@@ -29,18 +28,15 @@ public class GuestAccountService {
     private final UserMapper userMapper;
     private final LineupMapper lineupMapper;
     private final CoinTransactionMapper coinTransactionMapper;
-    private final MatchRecordMapper matchRecordMapper;
 
     public GuestAccountService(
             UserMapper userMapper,
             LineupMapper lineupMapper,
-            CoinTransactionMapper coinTransactionMapper,
-            MatchRecordMapper matchRecordMapper
+            CoinTransactionMapper coinTransactionMapper
     ) {
         this.userMapper = userMapper;
         this.lineupMapper = lineupMapper;
         this.coinTransactionMapper = coinTransactionMapper;
-        this.matchRecordMapper = matchRecordMapper;
     }
 
     @Transactional
@@ -49,9 +45,6 @@ public class GuestAccountService {
         if (userId != GUEST_USER_ID) return ApiResponse.fail("只能重置游客账号");
 
         coinTransactionMapper.deleteByUserId(GUEST_USER_ID);
-        matchRecordMapper.deleteAllGuestGoals(GUEST_USER_ID);
-        matchRecordMapper.deleteAllGuestActions(GUEST_USER_ID);
-        matchRecordMapper.deleteAllGuestRecords(GUEST_USER_ID);
 
         lineupMapper.deleteLineup(GUEST_USER_ID);
         lineupMapper.deleteOwnedPlayers(GUEST_USER_ID);

@@ -10,6 +10,8 @@ public class UserLoginSession {
 
     private String deviceId;
 
+    private String clientInstanceId;
+
     private String tokenHash;
 
     private LocalDateTime expiresAt;
@@ -44,6 +46,14 @@ public class UserLoginSession {
 
     public void setDeviceId(String deviceId) {
         this.deviceId = deviceId;
+    }
+
+    public String getClientInstanceId() {
+        return clientInstanceId;
+    }
+
+    public void setClientInstanceId(String clientInstanceId) {
+        this.clientInstanceId = clientInstanceId;
     }
 
     public String getTokenHash() {

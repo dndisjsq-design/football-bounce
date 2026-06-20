@@ -185,6 +185,8 @@ public class SingleMatchService {
                     0.72 + random.nextDouble() * 0.18,
                     0.0,
                     0.0,
+                    state.fieldWidth,
+                    state.fieldHeight,
                     System.currentTimeMillis()
             );
             recordAction(state, "away", actorId, "ai-penalty", command, true, "accepted");
@@ -209,6 +211,8 @@ public class SingleMatchService {
                 0.66 + random.nextDouble() * 0.08,
                 0.0,
                 0.0,
+                state.fieldWidth,
+                state.fieldHeight,
                 System.currentTimeMillis()
         );
         state.applyCommand(command);
@@ -298,10 +302,7 @@ public class SingleMatchService {
         if (mapper.countUnfinishedMatch(matchNo, userId) <= 0) {
             return new AbandonResponse(true, "没有需要清理的未完成比赛");
         }
-        mapper.deleteGoalsByMatchNo(matchNo);
-        mapper.deleteActionsByMatchNo(matchNo);
-        mapper.deleteUnfinishedMatchRecord(matchNo, userId);
-        return new AbandonResponse(true, "未完成比赛已删除");
+        return new AbandonResponse(true, "未完成比赛已保留");
     }
 
     private UserSummaryDto recordMatchResult(ServerMatchState state, String result) {
@@ -346,6 +347,8 @@ public class SingleMatchService {
                 command.power(),
                 command.curveAngleRad(),
                 command.curveDistance(),
+                command.fieldWidth(),
+                command.fieldHeight(),
                 command.clientTick()
         );
     }
@@ -359,6 +362,7 @@ public class SingleMatchService {
             Boolean valid,
             String message
     ) {
+        if (!shouldPersistReplayAction(actionType)) return;
         String safeSide = safeSide(actorSide);
         mapper.insertAction(
                 state.matchNo,
@@ -371,6 +375,13 @@ public class SingleMatchService {
                 valid,
                 message
         );
+    }
+
+    private static boolean shouldPersistReplayAction(String actionType) {
+        return "shoot".equals(actionType)
+                || "ai-shoot".equals(actionType)
+                || "ai-penalty".equals(actionType)
+                || "ai-keeper".equals(actionType);
     }
 
     private String toJson(Object value) {
@@ -1040,7 +1051,7 @@ public class SingleMatchService {
 
         private SnapshotDto snapshot() {
             List<BodyDto> playerDtos = players.stream().map(Body::dto).toList();
-            return new SnapshotDto(matchNo, "ai", tick, turn, new ScoreDto(scoreHome, scoreAway), playerDtos, ball.dto());
+            return new SnapshotDto(matchNo, "ai", fieldWidth, fieldHeight, tick, turn, new ScoreDto(scoreHome, scoreAway), playerDtos, ball.dto());
         }
 
         private boolean isSettled() {

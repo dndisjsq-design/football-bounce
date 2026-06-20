@@ -13,6 +13,9 @@ public class AutoLoginRequest {
     @Size(max = 128, message = "自动登录令牌长度不能超过 128")
     private String authToken;
 
+    @Size(max = 96, message = "运行实例标识长度不能超过 96")
+    private String clientInstanceId;
+
     public String getDeviceId() {
         return deviceId;
     }
@@ -27,5 +30,13 @@ public class AutoLoginRequest {
 
     public void setAuthToken(String authToken) {
         this.authToken = authToken;
+    }
+
+    public String getClientInstanceId() {
+        return clientInstanceId;
+    }
+
+    public void setClientInstanceId(String clientInstanceId) {
+        this.clientInstanceId = clientInstanceId;
     }
 }

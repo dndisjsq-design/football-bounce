@@ -16,6 +16,9 @@ public class LoginRequest {
     @Size(max = 128, message = "设备标识长度不能超过 128")
     private String deviceId;
 
+    @Size(max = 96, message = "运行实例标识长度不能超过 96")
+    private String clientInstanceId;
+
     public String getUsername() {
         return username;
     }
@@ -38,5 +41,13 @@ public class LoginRequest {
 
     public void setDeviceId(String deviceId) {
         this.deviceId = deviceId;
+    }
+
+    public String getClientInstanceId() {
+        return clientInstanceId;
+    }
+
+    public void setClientInstanceId(String clientInstanceId) {
+        this.clientInstanceId = clientInstanceId;
     }
 }

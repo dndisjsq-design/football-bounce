@@ -1,5 +1,6 @@
 package com.footballbounce.server.repository;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import org.apache.ibatis.annotations.Delete;
@@ -164,4 +165,36 @@ public interface MatchRecordMapper {
             WHERE user_id = #{userId}
             """)
     int deleteAllGuestRecords(@Param("userId") long userId);
+
+    @Delete("""
+            DELETE FROM match_goal_record
+            WHERE match_no IN (
+                SELECT old_match_no
+                FROM (
+                    SELECT DISTINCT match_no AS old_match_no
+                    FROM user_match_record
+                    WHERE match_time < #{cutoff}
+                ) old_matches
+            )
+            """)
+    int deleteGoalsBefore(@Param("cutoff") LocalDateTime cutoff);
+
+    @Delete("""
+            DELETE FROM match_action
+            WHERE match_no IN (
+                SELECT old_match_no
+                FROM (
+                    SELECT DISTINCT match_no AS old_match_no
+                    FROM user_match_record
+                    WHERE match_time < #{cutoff}
+                ) old_matches
+            )
+            """)
+    int deleteActionsBefore(@Param("cutoff") LocalDateTime cutoff);
+
+    @Delete("""
+            DELETE FROM user_match_record
+            WHERE match_time < #{cutoff}
+            """)
+    int deleteRecordsBefore(@Param("cutoff") LocalDateTime cutoff);
 }

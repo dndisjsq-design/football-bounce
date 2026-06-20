@@ -1,0 +1,1942 @@
+package com.footballbounce.server.service;
+
+import com.footballbounce.server.dto.match.OnlineMatchDtos.CancelRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.ActionPollRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.ActionResponse;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.ClockRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.ClockResponse;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.JoinRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.MatchmakingResponse;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.OnlineActionDto;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.OnlineClockDto;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.OnlinePlayerDto;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.OnlineShootCommandDto;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.ResultResponse;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.SettlementRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.SettlementResponse;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.StatusRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.SubmitResultRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.SubmitShootRequest;
+import com.footballbounce.server.dto.match.SingleMatchDtos.BestPlayerDto;
+import com.footballbounce.server.dto.match.SingleMatchDtos.BodyDto;
+import com.footballbounce.server.dto.match.SingleMatchDtos.PlayerSummary;
+import com.footballbounce.server.dto.match.SingleMatchDtos.ScoreDto;
+import com.footballbounce.server.dto.match.SingleMatchDtos.SettlementDto;
+import com.footballbounce.server.dto.match.SingleMatchDtos.SettlementGoalDto;
+import com.footballbounce.server.dto.match.SingleMatchDtos.SnapshotDto;
+import com.footballbounce.server.domain.UserLoginSession;
+import com.footballbounce.server.repository.SingleMatchMapper;
+import com.footballbounce.server.repository.UserLoginSessionMapper;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HexFormat;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class OnlineMatchService {
+    private static final long GUEST_USER_ID = 1L;
+    private static final long WAITING_EXPIRE_MILLIS = 60_000L;
+    private static final long MATCH_DURATION_MILLIS = 180_000L;
+    private static final long TURN_DURATION_MILLIS = 15_000L;
+    private static final long RESULT_CONFIRM_TIMEOUT_MILLIS = 20_000L;
+    private static final long ACTION_LONG_POLL_MILLIS = 3_500L;
+    private static final int WIN_SCORE = 3;
+    private static final double DEFAULT_FIELD_WIDTH = 362;
+    private static final double DEFAULT_FIELD_HEIGHT = 650;
+    private static final double PLAYER_RADIUS = 20;
+    private static final double BALL_RADIUS = 13;
+    private static final double PLAYER_SHOT_SPEED = 890;
+    private static final double PLAYER_MASS = 3.2;
+    private static final double BALL_MASS = 0.75;
+    private static final double PLAYER_FRICTION = 1.65;
+    private static final double BALL_FRICTION = 1.18;
+    private static final double PLAYER_STOP_SPEED = 5;
+    private static final double BALL_STOP_SPEED = 7;
+    private static final double PLAYER_LOW_SPEED_FRICTION_START = 170;
+    private static final double BALL_LOW_SPEED_FRICTION_START = 135;
+    private static final double PLAYER_TAIL_FRICTION = 5.4;
+    private static final double BALL_TAIL_FRICTION = 4.2;
+    private static final double PLAYER_RESTITUTION = 0.66;
+    private static final double BALL_RESTITUTION = 0.94;
+    private static final double GOAL_HALF_WIDTH = 63;
+    private static final double GOAL_DEPTH = 30;
+    private static final int SOLVER_ITERATIONS = 5;
+    private static final double MAX_CURVE_ANGLE = 0.92;
+    private static final double CURVE_MIN_DISTANCE = 34;
+    private static final double CORNER_CUSHION_RADIUS = 36;
+    private static final double CORNER_CUSHION_RESTITUTION = 0.92;
+    private static final double POSITION_TOLERANCE = 18.0;
+    private static final double VELOCITY_TOLERANCE = 12.0;
+
+    private static final Map<String, List<PointRatio>> FORMATIONS = Map.of(
+            "balanced-221", ratios(-0.18, -0.34, 0.18, -0.34, -0.16, -0.22, 0.16, -0.22, 0, -0.08),
+            "midfield-131", ratios(0, -0.35, -0.22, -0.22, 0, -0.22, 0.22, -0.22, 0, -0.08),
+            "defense-311", ratios(-0.23, -0.35, 0, -0.35, 0.23, -0.35, 0, -0.21, 0, -0.08),
+            "attack-122", ratios(0, -0.35, -0.18, -0.23, 0.18, -0.23, -0.16, -0.08, 0.16, -0.08),
+            "diamond-212", ratios(-0.19, -0.35, 0.19, -0.35, 0, -0.22, -0.18, -0.08, 0.18, -0.08)
+    );
+
+    private final Object lock = new Object();
+    private final SingleMatchMapper mapper;
+    private final UserLoginSessionMapper sessionMapper;
+    private final MatchRewardService matchRewardService;
+    private final Map<String, MatchmakingResponse> statuses = new ConcurrentHashMap<>();
+    private final Map<String, OnlineRuntimeMatch> runtimeMatches = new ConcurrentHashMap<>();
+    private WaitingPlayer waitingPlayer;
+
+    public OnlineMatchService(SingleMatchMapper mapper, UserLoginSessionMapper sessionMapper, MatchRewardService matchRewardService) {
+        this.mapper = mapper;
+        this.sessionMapper = sessionMapper;
+        this.matchRewardService = matchRewardService;
+    }
+
+    @Transactional
+    public MatchmakingResponse join(JoinRequest request) {
+        long userId = normalizeUserId(request == null ? null : request.userId());
+        String requestId = normalizeRequestId(request == null ? null : request.requestId());
+        String guestSessionId = safeText(request == null ? "" : request.guestSessionId());
+        String clientInstanceId = safeText(request == null ? "" : request.clientInstanceId());
+        MatchmakingResponse authError = validateOfficialSession(userId, request == null ? "" : request.deviceId(), request == null ? "" : request.authToken(), clientInstanceId, requestId);
+        if (authError != null) return authError;
+        synchronized (lock) {
+            MatchmakingResponse current = statuses.get(requestId);
+            if (current != null && !"CANCELLED".equals(current.status())) {
+                return current;
+            }
+            expireWaitingIfNeeded();
+            if (waitingPlayer != null && waitingPlayer.userId() == userId) {
+                statuses.put(waitingPlayer.requestId(), errorResponse(waitingPlayer.requestId(), "该账号已在其他窗口进入匹配，当前匹配已取消"));
+                waitingPlayer = null;
+            }
+            WaitingPlayer player;
+            try {
+                player = loadWaitingPlayer(userId, requestId, guestSessionId, clientInstanceId);
+            } catch (IllegalArgumentException ex) {
+                return errorResponse(requestId, ex.getMessage());
+            }
+            if (waitingPlayer == null || waitingPlayer.requestId().equals(requestId)) {
+                waitingPlayer = player;
+                MatchmakingResponse waiting = waitingResponse(player, "匹配中");
+                statuses.put(requestId, waiting);
+                return waiting;
+            }
+            WaitingPlayer first = waitingPlayer;
+            waitingPlayer = null;
+            String matchId = "online-" + UUID.randomUUID();
+            long matchedAt = System.currentTimeMillis();
+            insertOnlineMatchRecords(first, player, matchId);
+            OnlineRuntimeMatch runtimeMatch = createRuntimeMatch(first, player, matchId);
+            MatchmakingResponse firstResponse = matchedResponse(first, player, matchId, matchedAt, runtimeMatch);
+            MatchmakingResponse secondResponse = matchedResponse(player, first, matchId, matchedAt, runtimeMatch);
+            statuses.put(first.requestId(), firstResponse);
+            statuses.put(player.requestId(), secondResponse);
+            return secondResponse;
+        }
+    }
+
+    public ActionResponse submitShoot(SubmitShootRequest request) {
+        if (request == null) return actionError("操作参数为空");
+        long userId = normalizeUserId(request == null ? null : request.userId());
+        String requestId = safeText(request.requestId());
+        String matchId = safeText(request == null ? "" : request.matchId());
+        OnlineRuntimeMatch match = runtimeMatches.get(matchId);
+        if (match == null) return actionError("比赛不存在或已过期");
+        String authError = validateActionSession(userId, request == null ? "" : request.deviceId(), request == null ? "" : request.authToken(), request == null ? "" : request.clientInstanceId());
+        if (authError != null) return actionError(authError);
+        if (!match.hasPlayer(userId, requestId)) return actionError("用户不属于本场比赛");
+        FieldSize clientFieldSize = fieldSize(request.fieldWidth(), request.fieldHeight());
+        OnlineShootCommandDto command = new OnlineShootCommandDto(
+                safeText(request.commandId()).isBlank() ? UUID.randomUUID().toString() : safeText(request.commandId()),
+                matchId,
+                safeText(request.actorId()),
+                safeText(request.side()).isBlank() ? "home" : safeText(request.side()),
+                request.angleRad() == null ? 0 : request.angleRad(),
+                request.power() == null ? 0 : clamp(request.power(), 0, 1),
+                request.curveAngleRad(),
+                request.curveDistance(),
+                request.clientTick() == null ? System.currentTimeMillis() : request.clientTick()
+        );
+        synchronized (match) {
+            long now = System.currentTimeMillis();
+            match.advanceExpiredTurn(now);
+            String networkSide = match.networkSide(userId, requestId);
+            match.updateFieldSize(requestId, clientFieldSize);
+            if (match.finished) {
+                persistFinishedMatch(match, now);
+                return match.finishedActionResponse(now, networkSide);
+            }
+            if (!networkSide.equals(match.turnNetworkSide)) {
+                return new ActionResponse(false, "还没有轮到当前玩家", List.of(), match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+            }
+            if (match.awaitingConfirmation()) {
+                return new ActionResponse(false, "上一拍尚未完成服务端核验", List.of(), match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+            }
+            if (match.pendingByCommandId.containsKey(command.commandId())) {
+                return new ActionResponse(true, "操作已登记", List.of(), match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+            }
+            OnlineShootCommandDto serverCommand = canonicalCommand(command, networkSide, matchId, clientFieldSize);
+            ScoreDto scoreBefore = match.serverState.score();
+            SnapshotDto serverSnapshot = match.serverState.applyCommandAndSimulate(serverCommand);
+            if (serverSnapshot == null) {
+                return new ActionResponse(false, "服务端拒绝本次操作", List.of(), match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+            }
+            OnlineActionState action = new OnlineActionState(userId, requestId, networkSide, serverCommand, scoreBefore, serverSnapshot, now);
+            action.seq = ++match.lastPublishedSeq;
+            action.published = true;
+            action.publishedAtMillis = now;
+            match.pendingByCommandId.put(command.commandId(), action);
+            match.publishedActions.add(action);
+            match.publishedByCommandId.put(command.commandId(), action);
+            match.turnNetworkSide = match.opponentSide(action.actorNetworkSide);
+            mapper.insertAction(matchId, match.nextActionIndex(), userId, networkSide, serverCommand.actorId(), "online-shoot", commandJson(serverCommand), null, "pending");
+            match.notifyAll();
+            return new ActionResponse(true, "操作已登记并广播，等待双方结算确认", List.of(), match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+        }
+    }
+
+    public ResultResponse submitResult(SubmitResultRequest request) {
+        if (request == null) return resultError("结算参数为空");
+        long userId = normalizeUserId(request.userId());
+        String requestId = safeText(request.requestId());
+        String matchId = safeText(request.matchId());
+        String commandId = safeText(request.commandId());
+        OnlineRuntimeMatch match = runtimeMatches.get(matchId);
+        if (match == null) return resultError("比赛不存在或已过期");
+        String authError = validateActionSession(userId, request.deviceId(), request.authToken(), request.clientInstanceId());
+        if (authError != null) return resultError(authError);
+        if (!match.hasPlayer(userId, requestId)) return resultError("用户不属于本场比赛");
+        FieldSize clientFieldSize = fieldSizeFromResult(request);
+        synchronized (match) {
+            long now = System.currentTimeMillis();
+            match.advanceExpiredTurn(now);
+            String networkSide = match.networkSide(userId, requestId);
+            match.updateFieldSize(requestId, clientFieldSize);
+            if (match.finished) {
+                persistFinishedMatch(match, now);
+                return match.finishedResultResponse(now, networkSide);
+            }
+            OnlineActionState action = match.pendingByCommandId.get(commandId);
+            if (action == null) {
+                action = match.publishedByCommandId.get(commandId);
+            }
+            if (action == null) return resultError("操作不存在或已过期");
+            if ("goal".equals(safeText(request.eventType()))) {
+                return handleGoalResult(request, userId, requestId, matchId, match, now, networkSide, action);
+            }
+            SnapshotDto canonical = canonicalSnapshot(request.snapshot(), networkSide);
+            if (canonical == null) return resultError("结算快照为空");
+            String mismatch = compareSnapshots(action.expectedSnapshot, canonical);
+            boolean valid = mismatch.isEmpty();
+            if (valid) {
+                action.confirmedRequestIds.add(requestId);
+            }
+            if (!valid) {
+                match.finishWithLoser(networkSide, mismatch);
+                persistFinishedMatch(match, now);
+                match.notifyAll();
+                return new ResultResponse(false, false, false, mismatch, match.clock(now, networkSide), match.localWinnerSide(networkSide), match.localLoserSide(networkSide), match.localFinishScore(networkSide));
+            }
+            boolean confirmed = match.actionFullyConfirmed(action);
+            if (confirmed) {
+                action.confirmed = true;
+                match.pendingByCommandId.remove(commandId);
+                match.turnStartedAtMillis = now;
+            }
+            if (confirmed) {
+                match.notifyAll();
+            }
+            return new ResultResponse(
+                    true,
+                    true,
+                    confirmed,
+                    confirmed ? "双方结算已确认，下一回合已解锁" : "本端结算已确认，等待对方确认",
+                    match.clock(now, networkSide),
+                    null,
+                    null,
+                    null
+            );
+        }
+    }
+
+    private ResultResponse handleGoalResult(SubmitResultRequest request, long userId, String requestId, String matchId, OnlineRuntimeMatch match, long now, String networkSide, OnlineActionState action) {
+        String expectedGoalSide = action.expectedGoalSide();
+        if (expectedGoalSide.isBlank()) {
+            String message = "服务端未计算出本次射门进球";
+            match.finishWithLoser(networkSide, message);
+            persistFinishedMatch(match, now);
+            match.notifyAll();
+            return new ResultResponse(false, false, false, message, match.clock(now, networkSide), match.localWinnerSide(networkSide), match.localLoserSide(networkSide), match.localFinishScore(networkSide));
+        }
+        String eventSide = canonicalSide(safeText(request.eventSide()), networkSide);
+        String eventActorId = canonicalActorId(safeText(request.eventActorId()), networkSide);
+        String message = "";
+        if (!expectedGoalSide.equals(eventSide)) {
+            message = "进球方向与服务端计算结果不一致";
+        } else if (!action.command.actorId().equals(eventActorId)) {
+            message = "进球球员与服务端记录的射门球员不一致";
+        }
+        if (!message.isBlank()) {
+            match.finishWithLoser(networkSide, message);
+            persistFinishedMatch(match, now);
+            match.notifyAll();
+            return new ResultResponse(false, false, false, message, match.clock(now, networkSide), match.localWinnerSide(networkSide), match.localLoserSide(networkSide), match.localFinishScore(networkSide));
+        }
+        action.confirmedRequestIds.add(requestId);
+        boolean confirmed = match.actionFullyConfirmed(action);
+        boolean shouldPersistFinish = false;
+        if (confirmed && !action.confirmed) {
+            action.confirmed = true;
+            match.pendingByCommandId.remove(request.commandId());
+            recordOnlineGoal(match, action, expectedGoalSide, now);
+            match.turnNetworkSide = match.opponentSide(expectedGoalSide);
+            match.serverState.turn = match.turnNetworkSide;
+            match.serverState.resetObjects(match.turnNetworkSide);
+            match.turnStartedAtMillis = now;
+            if (match.serverState.score().home() >= WIN_SCORE || match.serverState.score().away() >= WIN_SCORE) {
+                match.finishWithWinner(expectedGoalSide, "比赛结束");
+                shouldPersistFinish = true;
+            }
+        }
+        if (shouldPersistFinish) persistFinishedMatch(match, now);
+        if (confirmed) match.notifyAll();
+        return new ResultResponse(
+                true,
+                true,
+                confirmed,
+                confirmed ? "进球已确认，下一回合已解锁" : "进球已确认，等待对方结果",
+                match.clock(now, networkSide),
+                match.localWinnerSide(networkSide),
+                match.localLoserSide(networkSide),
+                match.localFinishScore(networkSide)
+        );
+    }
+
+    private void recordOnlineGoal(OnlineRuntimeMatch match, OnlineActionState action, String goalSide, long now) {
+        if (match == null || action == null) return;
+        String actorId = safeText(action.command.actorId());
+        String actorSide = sideForActor(actorId, action.command.side());
+        boolean ownGoal = !actorSide.equals(goalSide);
+        int matchSecond = (int) Math.max(0, Math.min(MATCH_DURATION_MILLIS, now - match.startedAtMillis) / 1000);
+        long scorerUserId = match.userIdForSide(actorSide);
+        String scorerUsername = match.usernameForSide(actorSide);
+        String playerId = match.playerIdForActor(actorId);
+        String playerName = match.playerNameForId(actorSide, playerId);
+        mapper.insertGoal(match.matchId, match.nextGoalOrder(), matchSecond, scorerUserId, scorerUsername, goalSide, actorId, playerId, playerName, false, ownGoal);
+    }
+
+    public ActionResponse pollActions(ActionPollRequest request) {
+        long userId = normalizeUserId(request == null ? null : request.userId());
+        String requestId = safeText(request == null ? "" : request.requestId());
+        String matchId = safeText(request == null ? "" : request.matchId());
+        OnlineRuntimeMatch match = runtimeMatches.get(matchId);
+        if (match == null) return actionError("比赛不存在或已过期");
+        String authError = validateActionSession(userId, request == null ? "" : request.deviceId(), request == null ? "" : request.authToken(), request == null ? "" : request.clientInstanceId());
+        if (authError != null) return actionError(authError);
+        if (!match.hasPlayer(userId, requestId)) return actionError("用户不属于本场比赛");
+        long sinceSeq = request == null || request.sinceSeq() == null ? 0 : Math.max(0, request.sinceSeq());
+        FieldSize clientFieldSize = fieldSize(request == null ? null : request.fieldWidth(), request == null ? null : request.fieldHeight());
+        synchronized (match) {
+            match.updateFieldSize(requestId, clientFieldSize);
+            long deadline = System.currentTimeMillis() + ACTION_LONG_POLL_MILLIS;
+            while (!match.finished && match.lastPublishedSeq <= sinceSeq) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) break;
+                try {
+                    match.wait(remaining);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            long now = System.currentTimeMillis();
+            match.advanceExpiredTurn(now);
+            match.expireResultTimeouts(now);
+            String networkSide = match.networkSide(userId, requestId);
+            if (match.finished) {
+                persistFinishedMatch(match, now);
+                return match.finishedActionResponse(now, networkSide);
+            }
+            List<OnlineActionDto> actions = match.publishedActions.stream()
+                    .filter(action -> action.seq > sinceSeq)
+                    .map(action -> new OnlineActionDto(
+                            action.seq,
+                            action.actorUserId,
+                            action.actorRequestId,
+                            action.actorNetworkSide,
+                            localCommand(action.command, networkSide, match.fieldSizeForRequestId(requestId))
+                    ))
+                    .toList();
+            return new ActionResponse(true, "ok", actions, match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+        }
+    }
+
+    public ClockResponse clock(ClockRequest request) {
+        long userId = normalizeUserId(request == null ? null : request.userId());
+        String requestId = safeText(request == null ? "" : request.requestId());
+        String matchId = safeText(request == null ? "" : request.matchId());
+        OnlineRuntimeMatch match = runtimeMatches.get(matchId);
+        if (match == null) return new ClockResponse(false, "比赛不存在或已过期", null, null, null, null);
+        String authError = validateActionSession(userId, request == null ? "" : request.deviceId(), request == null ? "" : request.authToken(), request == null ? "" : request.clientInstanceId());
+        if (authError != null) return new ClockResponse(false, authError, null, null, null, null);
+        if (!match.hasPlayer(userId, requestId)) return new ClockResponse(false, "用户不属于本场比赛", null, null, null, null);
+        FieldSize clientFieldSize = fieldSize(request == null ? null : request.fieldWidth(), request == null ? null : request.fieldHeight());
+        synchronized (match) {
+            long now = System.currentTimeMillis();
+            match.advanceExpiredTurn(now);
+            match.expireResultTimeouts(now);
+            String networkSide = match.networkSide(userId, requestId);
+            match.updateFieldSize(requestId, clientFieldSize);
+            if (match.finished) {
+                persistFinishedMatch(match, now);
+                return new ClockResponse(false, match.finishMessage, match.clock(now, networkSide), match.localWinnerSide(networkSide), match.localLoserSide(networkSide), match.localFinishScore(networkSide));
+            }
+            return new ClockResponse(true, "ok", match.clock(now, networkSide), null, null, null);
+        }
+    }
+
+    public SettlementResponse settlement(SettlementRequest request) {
+        if (request == null) return settlementError("结算参数为空");
+        long userId = normalizeUserId(request.userId());
+        String requestId = safeText(request.requestId());
+        String matchId = safeText(request.matchId());
+        if (matchId.isBlank()) return settlementError("比赛编号为空");
+        String authError = validateActionSession(userId, request.deviceId(), request.authToken(), request.clientInstanceId());
+        if (authError != null) return settlementError(authError);
+        OnlineRuntimeMatch runtimeMatch = runtimeMatches.get(matchId);
+        if (runtimeMatch != null) {
+            synchronized (runtimeMatch) {
+                if (!runtimeMatch.hasPlayer(userId, requestId)) {
+                    return settlementError("用户不属于本场比赛");
+                }
+                if (runtimeMatch.finished) {
+                    persistFinishedMatch(runtimeMatch, System.currentTimeMillis());
+                }
+            }
+        }
+        boolean guestOnly = userId == GUEST_USER_ID;
+        String guestSessionId = safeText(request.guestSessionId());
+        if (guestOnly && guestSessionId.isBlank()) {
+            return settlementError("游客会话已失效");
+        }
+        Map<String, Object> record = mapper.findOnlineFinishedRecord(matchId, userId, guestOnly, guestSessionId);
+        if (record == null) {
+            return settlementError("未查询到已完成的多人比赛记录");
+        }
+        String userSide = "away".equals(stringValue(record.get("userSide"))) ? "away" : "home";
+        String result = stringValue(record.get("result"));
+        String scoreText = stringValue(record.get("resultScore"));
+        List<SettlementGoalDto> goals = mapper.findGoalsByMatchNo(matchId)
+                .stream()
+                .map(row -> settlementGoal(row, userSide))
+                .filter(goal -> !goal.penalty())
+                .sorted(Comparator.comparingInt(SettlementGoalDto::matchSecond)
+                        .thenComparingInt(SettlementGoalDto::order))
+                .toList();
+        String winnerSide = localWinnerSide(result, scoreText);
+        BestPlayerDto best = bestPlayer(winnerSide, goals);
+        SettlementDto settlement = new SettlementDto(matchId, result, scoreText, winnerSide, best, goals);
+        return new SettlementResponse(true, "查询成功", settlement);
+    }
+
+    public MatchmakingResponse status(StatusRequest request) {
+        long userId = normalizeUserId(request == null ? null : request.userId());
+        String requestId = normalizeRequestId(request == null ? null : request.requestId());
+        MatchmakingResponse authError = validateOfficialSession(userId, request == null ? "" : request.deviceId(), request == null ? "" : request.authToken(), request == null ? "" : request.clientInstanceId(), requestId);
+        if (authError != null) return authError;
+        synchronized (lock) {
+            expireWaitingIfNeeded();
+            MatchmakingResponse current = statuses.get(requestId);
+            if (current != null) {
+                return current;
+            }
+            return emptyResponse(requestId, "IDLE", "未进入匹配队列");
+        }
+    }
+
+    public MatchmakingResponse cancel(CancelRequest request) {
+        long userId = normalizeUserId(request == null ? null : request.userId());
+        String requestId = normalizeRequestId(request == null ? null : request.requestId());
+        MatchmakingResponse authError = validateOfficialSession(userId, request == null ? "" : request.deviceId(), request == null ? "" : request.authToken(), request == null ? "" : request.clientInstanceId(), requestId);
+        if (authError != null) return authError;
+        synchronized (lock) {
+            if (waitingPlayer != null && waitingPlayer.requestId().equals(requestId)) {
+                waitingPlayer = null;
+            }
+            MatchmakingResponse cancelled = emptyResponse(requestId, "CANCELLED", "已取消匹配");
+            statuses.put(requestId, cancelled);
+            return cancelled;
+        }
+    }
+
+    private void persistFinishedMatch(OnlineRuntimeMatch match, long now) {
+        if (match == null || !match.finished || match.recordPersisted) return;
+        match.recordPersisted = true;
+        ScoreDto score = adjustedFinishScore(match);
+        int duration = (int) Math.max(0, Math.min(MATCH_DURATION_MILLIS, now - match.startedAtMillis) / 1000);
+        boolean homeWin = "home".equals(match.winnerNetworkSide);
+        boolean awayWin = "away".equals(match.winnerNetworkSide);
+        mapper.finishMatch(match.matchId, match.homeUserId, duration, score.home() + " : " + score.away(), homeWin ? "win" : "lose");
+        mapper.finishMatch(match.matchId, match.awayUserId, duration, score.away() + " : " + score.home(), awayWin ? "win" : "lose");
+        matchRewardService.recordOnlineMatchResult(match.homeUserId, match.matchId, homeWin);
+        matchRewardService.recordOnlineMatchResult(match.awayUserId, match.matchId, awayWin);
+    }
+
+    private static ScoreDto adjustedFinishScore(OnlineRuntimeMatch match) {
+        ScoreDto score = match.serverState.score();
+        int home = score.home();
+        int away = score.away();
+        if ("home".equals(match.winnerNetworkSide) && home <= away) {
+            home = away + 1;
+        } else if ("away".equals(match.winnerNetworkSide) && away <= home) {
+            away = home + 1;
+        }
+        return new ScoreDto(home, away);
+    }
+
+    private static ScoreDto finishScoreOrNull(OnlineRuntimeMatch match) {
+        if (match == null || !match.finished) return null;
+        return adjustedFinishScore(match);
+    }
+
+    private static ScoreDto localScore(ScoreDto score, String targetNetworkSide) {
+        if (score == null) return null;
+        return "away".equals(targetNetworkSide) ? new ScoreDto(score.away(), score.home()) : score;
+    }
+
+    private void insertOnlineMatchRecords(
+            WaitingPlayer first,
+            WaitingPlayer second,
+            String matchId
+    ) {
+        WaitingPlayer home = homePlayer(first, second);
+        WaitingPlayer away = home == first ? second : first;
+        String homeIds = String.join(",", home.playerIds());
+        String awayIds = String.join(",", away.playerIds());
+        mapper.insertMatchRecord(matchId, home.userId(), home.username(), "home", home.clientSessionId(), "online", away.userId(), away.username(), home.formationId(), away.formationId(), homeIds, awayIds);
+        mapper.insertMatchRecord(matchId, away.userId(), away.username(), "away", away.clientSessionId(), "online", home.userId(), home.username(), home.formationId(), away.formationId(), homeIds, awayIds);
+    }
+
+    private OnlineRuntimeMatch createRuntimeMatch(WaitingPlayer first, WaitingPlayer second, String matchId) {
+        WaitingPlayer home = homePlayer(first, second);
+        WaitingPlayer away = home == first ? second : first;
+        OnlineRuntimeMatch runtimeMatch = new OnlineRuntimeMatch(
+                matchId,
+                home.userId(),
+                home.requestId(),
+                home.username(),
+                home.formationId(),
+                home.lineup(),
+                away.userId(),
+                away.requestId(),
+                away.username(),
+                away.formationId(),
+                away.lineup(),
+                System.currentTimeMillis()
+        );
+        runtimeMatches.put(matchId, runtimeMatch);
+        return runtimeMatch;
+    }
+
+    private MatchmakingResponse matchedResponse(WaitingPlayer self, WaitingPlayer other, String matchId, long matchedAt, OnlineRuntimeMatch runtimeMatch) {
+        WaitingPlayer first = self.joinedAtMillis() <= other.joinedAtMillis() ? self : other;
+        WaitingPlayer second = first == self ? other : self;
+        WaitingPlayer home = homePlayer(first, second);
+        WaitingPlayer away = home == first ? second : first;
+        String selfSide = self == home ? "home" : "away";
+        boolean selfIsAway = "away".equals(selfSide);
+        SnapshotDto snapshot = runtimeMatch == null ? null : runtimeMatch.localSnapshot(selfSide);
+        return new MatchmakingResponse(
+                true,
+                "匹配成功",
+                "MATCHED",
+                self.requestId(),
+                matchId,
+                selfSide,
+                selfIsAway ? "away" : "home",
+                playerDto(first),
+                playerDto(second),
+                playerDto(self),
+                playerDto(other),
+                selfIsAway ? away.formationId() : home.formationId(),
+                selfIsAway ? home.formationId() : away.formationId(),
+                selfIsAway ? away.lineup() : home.lineup(),
+                selfIsAway ? home.lineup() : away.lineup(),
+                matchedAt,
+                snapshot
+        );
+    }
+
+    private MatchmakingResponse waitingResponse(WaitingPlayer player, String message) {
+        return new MatchmakingResponse(
+                true,
+                message,
+                "WAITING",
+                player.requestId(),
+                null,
+                null,
+                null,
+                playerDto(player),
+                null,
+                null,
+                null,
+                null,
+                null,
+                List.of(),
+                List.of(),
+                0,
+                null
+        );
+    }
+
+    private MatchmakingResponse emptyResponse(String requestId, String status, String message) {
+        return new MatchmakingResponse(
+                true,
+                message,
+                status,
+                requestId,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                List.of(),
+                List.of(),
+                0,
+                null
+        );
+    }
+
+    private MatchmakingResponse errorResponse(String requestId, String message) {
+        return new MatchmakingResponse(
+                false,
+                message,
+                "ERROR",
+                requestId,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                List.of(),
+                List.of(),
+                0,
+                null
+        );
+    }
+
+    private MatchmakingResponse validateOfficialSession(long userId, String deviceIdValue, String authTokenValue, String clientInstanceIdValue, String requestId) {
+        if (userId == GUEST_USER_ID) return null;
+        String deviceId = safeText(deviceIdValue);
+        String authToken = safeText(authTokenValue);
+        String clientInstanceId = safeText(clientInstanceIdValue);
+        if (deviceId.isBlank() || authToken.isBlank() || clientInstanceId.isBlank()) {
+            return errorResponse(requestId, "请重新登录后再进入真人联机");
+        }
+        UserLoginSession session = sessionMapper.findActiveForInstance(deviceId, sha256Hex(authToken), clientInstanceId);
+        if (session == null || !Long.valueOf(userId).equals(session.getUserId())) {
+            return errorResponse(requestId, "该账号已在其他设备登录，请重新登录");
+        }
+        sessionMapper.touch(session.getId());
+        return null;
+    }
+
+    private String validateActionSession(long userId, String deviceIdValue, String authTokenValue, String clientInstanceIdValue) {
+        if (userId == GUEST_USER_ID) return null;
+        String deviceId = safeText(deviceIdValue);
+        String authToken = safeText(authTokenValue);
+        String clientInstanceId = safeText(clientInstanceIdValue);
+        if (deviceId.isBlank() || authToken.isBlank() || clientInstanceId.isBlank()) {
+            return "请重新登录后再进入真人联机";
+        }
+        UserLoginSession session = sessionMapper.findActiveForInstance(deviceId, sha256Hex(authToken), clientInstanceId);
+        if (session == null || !Long.valueOf(userId).equals(session.getUserId())) {
+            return "该账号已在其他设备登录，请重新登录";
+        }
+        sessionMapper.touch(session.getId());
+        return null;
+    }
+
+    private ActionResponse actionError(String message) {
+        return new ActionResponse(false, message, List.of(), 0, null, null, null, null);
+    }
+
+    private ResultResponse resultError(String message) {
+        return new ResultResponse(false, false, false, message, null, null, null, null);
+    }
+
+    private SettlementResponse settlementError(String message) {
+        return new SettlementResponse(false, message, null);
+    }
+
+    private SettlementGoalDto settlementGoal(Map<String, Object> row, String targetNetworkSide) {
+        String canonicalSide = "away".equals(stringValue(row.get("side"))) ? "away" : "home";
+        String actorId = stringValue(row.get("actorId"));
+        boolean mirror = "away".equals(targetNetworkSide);
+        return new SettlementGoalDto(
+                intValue(row.get("matchSecond")),
+                boolValue(row.get("penalty")),
+                longValue(row.get("userId")),
+                stringValue(row.get("username")),
+                localSide(canonicalSide, targetNetworkSide),
+                mirror ? swapPlayerId(actorId) : actorId,
+                stringValue(row.get("playerId")),
+                stringValue(row.get("playerName")),
+                boolValue(row.get("ownGoal")),
+                intValue(row.get("goalOrder"))
+        );
+    }
+
+    private static String localWinnerSide(String result, String scoreText) {
+        String safeResult = safeTextStatic(result);
+        if ("win".equals(safeResult)) return "home";
+        if ("lose".equals(safeResult)) return "away";
+        int[] score = parseScoreText(scoreText);
+        if (score[0] > score[1]) return "home";
+        if (score[1] > score[0]) return "away";
+        return "draw";
+    }
+
+    private static int[] parseScoreText(String scoreText) {
+        String[] parts = safeTextStatic(scoreText).replace('：', ':').split(":");
+        if (parts.length < 2) return new int[] {0, 0};
+        return new int[] {leadingInt(parts[0]), leadingInt(parts[1])};
+    }
+
+    private static int leadingInt(String text) {
+        String value = safeTextStatic(text);
+        StringBuilder digits = new StringBuilder();
+        for (int i = 0; i < value.length(); i += 1) {
+            char c = value.charAt(i);
+            if (Character.isDigit(c)) {
+                digits.append(c);
+            } else if (digits.length() > 0) {
+                break;
+            }
+        }
+        if (digits.length() == 0) return 0;
+        try {
+            return Integer.parseInt(digits.toString());
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
+    }
+
+    private static BestPlayerDto bestPlayer(String winnerSide, List<SettlementGoalDto> goals) {
+        if (!"home".equals(winnerSide) && !"away".equals(winnerSide)) {
+            return null;
+        }
+        Map<String, SettlementPlayerGoalCount> counts = new HashMap<>();
+        for (SettlementGoalDto goal : goals) {
+            if (goal.ownGoal() || !winnerSide.equals(goal.side())) {
+                continue;
+            }
+            String key = safeTextStatic(goal.playerId()).isBlank() ? safeTextStatic(goal.actorId()) : safeTextStatic(goal.playerId());
+            SettlementPlayerGoalCount current = counts.computeIfAbsent(key, ignored -> new SettlementPlayerGoalCount(goal));
+            current.goals += 1;
+            current.firstOrder = Math.min(current.firstOrder, goal.order());
+        }
+        return counts.values()
+                .stream()
+                .sorted(Comparator.comparingInt(SettlementPlayerGoalCount::goals).reversed()
+                        .thenComparingInt(SettlementPlayerGoalCount::firstOrder))
+                .map(SettlementPlayerGoalCount::toDto)
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static FieldSize fieldSize(Double width, Double height) {
+        return new FieldSize(positiveOrDefault(width, DEFAULT_FIELD_WIDTH), positiveOrDefault(height, DEFAULT_FIELD_HEIGHT));
+    }
+
+    private static FieldSize fieldSizeFromResult(SubmitResultRequest request) {
+        SnapshotDto snapshot = request == null ? null : request.snapshot();
+        Double width = snapshot == null || snapshot.fieldWidth() == null ? (request == null ? null : request.fieldWidth()) : snapshot.fieldWidth();
+        Double height = snapshot == null || snapshot.fieldHeight() == null ? (request == null ? null : request.fieldHeight()) : snapshot.fieldHeight();
+        return fieldSize(width, height);
+    }
+
+    private static FieldSize canonicalFieldSize() {
+        return new FieldSize(DEFAULT_FIELD_WIDTH, DEFAULT_FIELD_HEIGHT);
+    }
+
+    private static double positiveOrDefault(Double value, double fallback) {
+        return value == null || !Double.isFinite(value) || value <= 0 ? fallback : value;
+    }
+
+    private static SnapshotDto scaleSnapshotToField(SnapshotDto snapshot, FieldSize source, FieldSize target) {
+        if (snapshot == null) return null;
+        List<BodyDto> scaledPlayers = snapshot.players() == null
+                ? List.of()
+                : snapshot.players().stream().map(body -> scaleBodyToField(body, source, target)).toList();
+        return new SnapshotDto(
+                snapshot.matchId(),
+                snapshot.mode(),
+                target.width(),
+                target.height(),
+                snapshot.tick(),
+                snapshot.turn(),
+                snapshot.score(),
+                scaledPlayers,
+                scaleBodyToField(snapshot.ball(), source, target)
+        );
+    }
+
+    private static BodyDto scaleBodyToField(BodyDto body, FieldSize source, FieldSize target) {
+        if (body == null) return null;
+        double sx = target.width() / source.width();
+        double sy = target.height() / source.height();
+        return new BodyDto(
+                body.id(),
+                body.kind(),
+                body.side(),
+                body.x() * sx,
+                body.y() * sy,
+                body.vx() * sx,
+                body.vy() * sy,
+                body.radius(),
+                body.mass(),
+                body.friction(),
+                body.restitution()
+        );
+    }
+
+    private static double distanceScaleForAngle(double angleRad, FieldSize source, FieldSize target) {
+        double sx = target.width() / source.width();
+        double sy = target.height() / source.height();
+        return Math.hypot(Math.cos(angleRad) * sx, Math.sin(angleRad) * sy);
+    }
+
+    private static double angleBetweenFields(double angleRad, FieldSize source, FieldSize target, boolean rotateHalfTurn) {
+        double sx = target.width() / source.width();
+        double sy = target.height() / source.height();
+        double x = Math.cos(angleRad) * sx;
+        double y = Math.sin(angleRad) * sy;
+        if (rotateHalfTurn) {
+            x = -x;
+            y = -y;
+        }
+        return normalizeAngle(Math.atan2(y, x));
+    }
+
+    private static SnapshotDto canonicalSnapshot(SnapshotDto snapshot, String localNetworkSide) {
+        if (snapshot == null) return null;
+        SnapshotDto normalized = scaleSnapshotToField(snapshot, fieldSize(snapshot.fieldWidth(), snapshot.fieldHeight()), canonicalFieldSize());
+        return "away".equals(localNetworkSide) ? mirrorSnapshot(normalized) : normalized;
+    }
+
+    private static String canonicalSide(String localSide, String localNetworkSide) {
+        String value = "away".equals(localSide) ? "away" : "home";
+        return "away".equals(localNetworkSide) ? swapSide(value) : value;
+    }
+
+    private static String canonicalActorId(String localActorId, String localNetworkSide) {
+        String value = safeTextStatic(localActorId);
+        return "away".equals(localNetworkSide) ? swapPlayerId(value) : value;
+    }
+
+    private static OnlineShootCommandDto canonicalCommand(OnlineShootCommandDto command, String networkSide, String matchId, FieldSize sourceFieldSize) {
+        double localAngle = normalizeAngle(command.angleRad());
+        double canonicalAngle = angleBetweenFields(localAngle, sourceFieldSize, canonicalFieldSize(), "away".equals(networkSide));
+        double distanceScale = distanceScaleForAngle(localAngle, sourceFieldSize, canonicalFieldSize());
+        double canonicalPower = clamp(command.power(), 0, 1) * distanceScale;
+        Double canonicalCurveDistance = command.curveDistance() == null ? null : Math.max(0, command.curveDistance()) * distanceScale;
+        if (!"away".equals(networkSide)) {
+            return new OnlineShootCommandDto(
+                    command.commandId(),
+                    matchId,
+                    command.actorId(),
+                    "home",
+                    canonicalAngle,
+                    canonicalPower,
+                    command.curveAngleRad(),
+                    canonicalCurveDistance,
+                    command.clientTick()
+            );
+        }
+        return new OnlineShootCommandDto(
+                command.commandId(),
+                matchId,
+                swapPlayerId(command.actorId()),
+                "away",
+                canonicalAngle,
+                canonicalPower,
+                command.curveAngleRad(),
+                canonicalCurveDistance,
+                command.clientTick()
+        );
+    }
+
+    private static OnlineShootCommandDto localCommand(OnlineShootCommandDto canonical, String targetNetworkSide, FieldSize targetFieldSize) {
+        if (canonical == null) return null;
+        double orientedCanonicalAngle = "away".equals(targetNetworkSide)
+                ? rotateHalfTurnAngle(canonical.angleRad())
+                : normalizeAngle(canonical.angleRad());
+        double localAngle = angleBetweenFields(orientedCanonicalAngle, canonicalFieldSize(), targetFieldSize, false);
+        double distanceScale = distanceScaleForAngle(localAngle, targetFieldSize, canonicalFieldSize());
+        double localPower = distanceScale <= 0 ? canonical.power() : canonical.power() / distanceScale;
+        Double localCurveDistance = canonical.curveDistance() == null || distanceScale <= 0
+                ? canonical.curveDistance()
+                : canonical.curveDistance() / distanceScale;
+        if (!"away".equals(targetNetworkSide)) {
+            return new OnlineShootCommandDto(
+                    canonical.commandId(),
+                    canonical.matchId(),
+                    canonical.actorId(),
+                    canonical.side(),
+                    localAngle,
+                    localPower,
+                    canonical.curveAngleRad(),
+                    localCurveDistance,
+                    canonical.clientTick()
+            );
+        }
+        return new OnlineShootCommandDto(
+                canonical.commandId(),
+                canonical.matchId(),
+                swapPlayerId(canonical.actorId()),
+                swapSide(canonical.side()),
+                localAngle,
+                localPower,
+                canonical.curveAngleRad(),
+                localCurveDistance,
+                canonical.clientTick()
+        );
+    }
+
+    private static double rotateHalfTurnAngle(double angleRad) {
+        return normalizeAngle(angleRad + Math.PI);
+    }
+
+    private static SnapshotDto mirrorSnapshot(SnapshotDto snapshot) {
+        ScoreDto score = snapshot.score() == null
+                ? new ScoreDto(0, 0)
+                : new ScoreDto(snapshot.score().away(), snapshot.score().home());
+        List<BodyDto> mirroredPlayers = snapshot.players() == null
+                ? List.of()
+                : snapshot.players().stream().map(OnlineMatchService::mirrorPlayerBody).toList();
+        return new SnapshotDto(
+                snapshot.matchId(),
+                snapshot.mode(),
+                snapshot.fieldWidth(),
+                snapshot.fieldHeight(),
+                snapshot.tick(),
+                swapSide(snapshot.turn()),
+                score,
+                mirroredPlayers,
+                mirrorBallBody(snapshot.ball())
+        );
+    }
+
+    private static BodyDto mirrorPlayerBody(BodyDto body) {
+        if (body == null) return null;
+        String side = swapSide(body.side());
+        return new BodyDto(
+                swapPlayerId(body.id()),
+                body.kind(),
+                side,
+                -body.x(),
+                -body.y(),
+                -body.vx(),
+                -body.vy(),
+                body.radius(),
+                body.mass(),
+                body.friction(),
+                body.restitution()
+        );
+    }
+
+    private static BodyDto mirrorBallBody(BodyDto body) {
+        if (body == null) return null;
+        return new BodyDto(
+                body.id(),
+                body.kind(),
+                body.side(),
+                -body.x(),
+                -body.y(),
+                -body.vx(),
+                -body.vy(),
+                body.radius(),
+                body.mass(),
+                body.friction(),
+                body.restitution()
+        );
+    }
+
+    private static String swapSide(String side) {
+        return "away".equals(side) ? "home" : "away";
+    }
+
+    private static String localSide(String canonicalSide, String targetNetworkSide) {
+        String value = "away".equals(canonicalSide) ? "away" : "home";
+        return "away".equals(targetNetworkSide) ? swapSide(value) : value;
+    }
+
+    private static String swapPlayerId(String id) {
+        String value = id == null ? "" : id.trim();
+        if (value.startsWith("home-")) return "away-" + value.substring("home-".length());
+        if (value.startsWith("away-")) return "home-" + value.substring("away-".length());
+        return value;
+    }
+
+    private static double normalizeAngle(double angle) {
+        double value = angle;
+        while (value > Math.PI) value -= Math.PI * 2;
+        while (value < -Math.PI) value += Math.PI * 2;
+        return value;
+    }
+
+    private static String compareSnapshots(SnapshotDto expected, SnapshotDto actual) {
+        if (expected == null || actual == null) return "结算快照为空";
+        if (expected.score() != null && actual.score() != null) {
+            if (expected.score().home() != actual.score().home() || expected.score().away() != actual.score().away()) {
+                return "比分校验不一致 expected=" + expected.score().home() + ":" + expected.score().away()
+                        + " actual=" + actual.score().home() + ":" + actual.score().away();
+            }
+        }
+        if (!safeTextStatic(expected.turn()).equals(safeTextStatic(actual.turn()))) {
+            return "回合校验不一致 expected=" + safeTextStatic(expected.turn()) + " actual=" + safeTextStatic(actual.turn());
+        }
+        String ballMismatch = compareBody("足球", expected.ball(), actual.ball());
+        if (!ballMismatch.isBlank()) return ballMismatch;
+        Map<String, BodyDto> actualPlayers = new HashMap<>();
+        if (actual.players() != null) {
+            for (BodyDto body : actual.players()) {
+                if (body != null) actualPlayers.put(safeTextStatic(body.id()), body);
+            }
+        }
+        if (expected.players() != null) {
+            for (BodyDto expectedPlayer : expected.players()) {
+                if (expectedPlayer == null) continue;
+                BodyDto actualPlayer = actualPlayers.get(safeTextStatic(expectedPlayer.id()));
+                String mismatch = compareBody("球员" + expectedPlayer.id(), expectedPlayer, actualPlayer);
+                if (!mismatch.isBlank()) return mismatch;
+            }
+        }
+        return "";
+    }
+
+    private static String compareBody(String label, BodyDto expected, BodyDto actual) {
+        if (expected == null || actual == null) return label + "缺失";
+        if (Math.abs(expected.x() - actual.x()) > POSITION_TOLERANCE || Math.abs(expected.y() - actual.y()) > POSITION_TOLERANCE) {
+            return label + "位置校验不一致 dx=" + round(actual.x() - expected.x()) + " dy=" + round(actual.y() - expected.y())
+                    + " expected=(" + expected.x() + "," + expected.y() + ") actual=(" + actual.x() + "," + actual.y() + ")";
+        }
+        if (Math.abs(expected.vx() - actual.vx()) > VELOCITY_TOLERANCE || Math.abs(expected.vy() - actual.vy()) > VELOCITY_TOLERANCE) {
+            return label + "速度校验不一致 dvx=" + round(actual.vx() - expected.vx()) + " dvy=" + round(actual.vy() - expected.vy())
+                    + " expected=(" + expected.vx() + "," + expected.vy() + ") actual=(" + actual.vx() + "," + actual.vy() + ")";
+        }
+        return "";
+    }
+
+    private static String commandJson(OnlineShootCommandDto command) {
+        if (command == null) return "{}";
+        return "{"
+                + "\"commandId\":\"" + jsonEscape(command.commandId()) + "\","
+                + "\"matchId\":\"" + jsonEscape(command.matchId()) + "\","
+                + "\"actorId\":\"" + jsonEscape(command.actorId()) + "\","
+                + "\"side\":\"" + jsonEscape(command.side()) + "\","
+                + "\"angleRad\":" + command.angleRad() + ","
+                + "\"power\":" + command.power() + ","
+                + "\"curveAngleRad\":" + (command.curveAngleRad() == null ? 0 : command.curveAngleRad()) + ","
+                + "\"curveDistance\":" + (command.curveDistance() == null ? 0 : command.curveDistance()) + ","
+                + "\"clientTick\":" + command.clientTick()
+                + "}";
+    }
+
+    private static String jsonEscape(String value) {
+        if (value == null) return "";
+        return value
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r");
+    }
+
+    private static String safeTextStatic(String value) {
+        return value == null ? "" : value.trim();
+    }
+
+    private static String sideForActor(String actorId, String fallbackSide) {
+        String value = safeTextStatic(actorId);
+        if (value.startsWith("home-")) return "home";
+        if (value.startsWith("away-")) return "away";
+        return "away".equals(fallbackSide) ? "away" : "home";
+    }
+
+    private static int slotIndex(String actorId) {
+        String value = safeTextStatic(actorId);
+        int dash = value.indexOf('-');
+        if (dash < 0 || dash + 1 >= value.length()) return -1;
+        try {
+            return Integer.parseInt(value.substring(dash + 1)) - 1;
+        } catch (Exception ignored) {
+            return -1;
+        }
+    }
+
+    private WaitingPlayer loadWaitingPlayer(long userId, String requestId, String guestSessionId, String clientInstanceId) {
+        Map<String, Object> user = mapper.findUser(userId);
+        if (user == null) {
+            throw new IllegalArgumentException("用户不存在");
+        }
+        Map<String, Object> lineup = mapper.findUserLineup(userId);
+        if (lineup == null) {
+            throw new IllegalArgumentException("请先设置阵容");
+        }
+        String formationId = stringValue(lineup.get("selectedFormationId"));
+        List<String> playerIds = List.of(
+                stringValue(lineup.get("slot1PlayerId")),
+                stringValue(lineup.get("slot2PlayerId")),
+                stringValue(lineup.get("slot3PlayerId")),
+                stringValue(lineup.get("slot4PlayerId")),
+                stringValue(lineup.get("slot5PlayerId"))
+        );
+        List<PlayerSummary> players = loadLineupPlayers(playerIds);
+        return new WaitingPlayer(
+                userId,
+                requestId,
+                userId == GUEST_USER_ID ? guestSessionId : "",
+                clientInstanceId,
+                stringValue(user.get("username")),
+                stringValue(user.get("displayName")),
+                stringValue(user.get("avatarUrl")),
+                formationId,
+                playerIds,
+                players,
+                System.currentTimeMillis()
+        );
+    }
+
+    private List<PlayerSummary> loadLineupPlayers(List<String> playerIds) {
+        List<Map<String, Object>> rows = mapper.findPlayersByIds(playerIds);
+        Map<String, PlayerSummary> byId = new HashMap<>();
+        for (Map<String, Object> row : rows) {
+            PlayerSummary player = new PlayerSummary(
+                    stringValue(row.get("id")),
+                    stringValue(row.get("name")),
+                    intValue(row.get("score")),
+                    stringValue(row.get("rarity")),
+                    intValue(row.get("avatarSeed"))
+            );
+            byId.put(player.id(), player);
+        }
+        List<PlayerSummary> ordered = new ArrayList<>();
+        for (String id : playerIds) {
+            PlayerSummary player = byId.get(id);
+            if (player != null) ordered.add(player);
+        }
+        return ordered;
+    }
+
+    private void expireWaitingIfNeeded() {
+        if (waitingPlayer == null) return;
+        if (System.currentTimeMillis() - waitingPlayer.joinedAtMillis() <= WAITING_EXPIRE_MILLIS) return;
+        statuses.put(waitingPlayer.requestId(), emptyResponse(waitingPlayer.requestId(), "EXPIRED", "匹配已超时"));
+        waitingPlayer = null;
+    }
+
+    private WaitingPlayer homePlayer(WaitingPlayer first, WaitingPlayer second) {
+        if (first.userId() < second.userId()) return first;
+        if (second.userId() < first.userId()) return second;
+        return first;
+    }
+
+    private OnlinePlayerDto playerDto(WaitingPlayer player) {
+        if (player == null) return null;
+        return new OnlinePlayerDto(player.userId(), player.username(), player.displayName(), player.avatarUrl());
+    }
+
+    private long normalizeUserId(Long userId) {
+        return userId == null || userId <= 0 ? GUEST_USER_ID : userId;
+    }
+
+    private String normalizeRequestId(String requestId) {
+        String value = safeText(requestId);
+        return value.isBlank() ? UUID.randomUUID().toString() : value;
+    }
+
+    private String safeText(String value) {
+        return value == null ? "" : value.trim();
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? "" : String.valueOf(value).trim();
+    }
+
+    private int intValue(Object value) {
+        if (value instanceof Number number) return number.intValue();
+        try {
+            return Integer.parseInt(String.valueOf(value));
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    private static long longValue(Object value) {
+        if (value instanceof Number number) return number.longValue();
+        try {
+            return Long.parseLong(String.valueOf(value));
+        } catch (Exception ignored) {
+            return 0L;
+        }
+    }
+
+    private static boolean boolValue(Object value) {
+        if (value instanceof Boolean bool) return bool;
+        if (value instanceof Number number) return number.intValue() != 0;
+        String text = value == null ? "" : String.valueOf(value).trim();
+        return "1".equals(text) || Boolean.parseBoolean(text);
+    }
+
+    private static double clamp(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private String sha256Hex(String value) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException ex) {
+            throw new IllegalStateException("SHA-256 is not available", ex);
+        }
+    }
+
+    private record WaitingPlayer(
+            Long userId,
+            String requestId,
+            String clientSessionId,
+            String clientInstanceId,
+            String username,
+            String displayName,
+            String avatarUrl,
+            String formationId,
+            List<String> playerIds,
+            List<PlayerSummary> lineup,
+            long joinedAtMillis
+    ) {
+    }
+
+    private static final class Body {
+        private final String id;
+        private final String kind;
+        private final String side;
+        private double x;
+        private double y;
+        private double vx;
+        private double vy;
+        private final double radius;
+        private final double mass;
+        private final double friction;
+        private final double restitution;
+
+        private Body(String id, String kind, String side, double x, double y, double radius, double mass, double friction, double restitution) {
+            this.id = id;
+            this.kind = kind;
+            this.side = side;
+            this.x = x;
+            this.y = y;
+            this.radius = radius;
+            this.mass = mass;
+            this.friction = friction;
+            this.restitution = restitution;
+        }
+
+        private BodyDto dto() {
+            return new BodyDto(id, kind, side, round(x), round(y), round(vx), round(vy), radius, mass, friction, restitution);
+        }
+    }
+
+    private static final class OnlineServerState {
+        private final String matchId;
+        private final String homeFormationId;
+        private final String awayFormationId;
+        private final double fieldWidth;
+        private final double fieldHeight;
+        private final List<Body> players = new ArrayList<>();
+        private final Map<String, CurveMotion> activeCurves = new HashMap<>();
+        private Body ball;
+        private String turn = "home";
+        private int scoreHome = 0;
+        private int scoreAway = 0;
+        private long tick = 0;
+        private boolean goalLocked = false;
+
+        private OnlineServerState(String matchId, String homeFormationId, String awayFormationId, double fieldWidth, double fieldHeight) {
+            this.matchId = matchId == null ? "" : matchId;
+            this.homeFormationId = homeFormationId;
+            this.awayFormationId = awayFormationId;
+            this.fieldWidth = fieldWidth;
+            this.fieldHeight = fieldHeight;
+        }
+
+        private void resetObjects(String startingTurn) {
+            players.clear();
+            activeCurves.clear();
+            turn = startingTurn;
+            goalLocked = false;
+            ball = makeBall(0, 0);
+            List<PointRatio> homeFormation = FORMATIONS.getOrDefault(homeFormationId, FORMATIONS.get("balanced-221"));
+            List<PointRatio> awayFormation = FORMATIONS.getOrDefault(awayFormationId, FORMATIONS.get("balanced-221"));
+            for (int i = 0; i < 5; i += 1) {
+                PointRatio point = homeFormation.get(Math.min(i, homeFormation.size() - 1));
+                players.add(makePlayer("home-" + (i + 1), "home", point.x * fieldWidth, point.y * fieldHeight));
+            }
+            for (int i = 0; i < 5; i += 1) {
+                PointRatio point = awayFormation.get(Math.min(i, awayFormation.size() - 1));
+                players.add(makePlayer("away-" + (i + 1), "away", point.x * fieldWidth, point.y * fieldHeight * -1));
+            }
+            resolveAllCollisions();
+        }
+
+        private SnapshotDto applyCommandAndSimulate(OnlineShootCommandDto command) {
+            if (!applyCommand(command)) {
+                return null;
+            }
+            simulateUntilSettled();
+            return snapshot();
+        }
+
+        private boolean applyCommand(OnlineShootCommandDto command) {
+            Body actor = findBody(command.actorId());
+            if (actor == null || !actor.side.equals(command.side()) || !command.side().equals(turn) || !isSettled()) {
+                return false;
+            }
+            double curveAngle = clamp(command.curveAngleRad() == null ? 0 : command.curveAngleRad(), -MAX_CURVE_ANGLE, MAX_CURVE_ANGLE);
+            double curveDistance = Math.max(0, command.curveDistance() == null ? 0 : command.curveDistance());
+            boolean hasCurve = Math.abs(curveAngle) > 0.03 && curveDistance > CURVE_MIN_DISTANCE;
+            double shotAngle = command.angleRad() + (hasCurve ? curveAngle : 0);
+            double speed = PLAYER_SHOT_SPEED * Math.max(0, command.power());
+            actor.vx = Math.cos(shotAngle) * speed;
+            actor.vy = Math.sin(shotAngle) * speed;
+            activeCurves.clear();
+            if (hasCurve) {
+                activeCurves.put(actor.id, new CurveMotion(-curveAngle * 2, curveDistance));
+            }
+            turn = "home".equals(turn) ? "away" : "home";
+            goalLocked = false;
+            return true;
+        }
+
+        private void simulateUntilSettled() {
+            int maxSteps = 120 * 18;
+            double dt = 1.0 / 120.0;
+            for (int i = 0; i < maxSteps; i += 1) {
+                step(dt);
+                tick += 1;
+                if (i > 12 && isSettled()) {
+                    break;
+                }
+            }
+        }
+
+        private void step(double dt) {
+            for (Body body : bodies()) {
+                integrateBody(body, dt);
+            }
+            resolveAllCollisions();
+            checkGoal();
+        }
+
+        private void integrateBody(Body body, double dt) {
+            double speedBeforeDamping = speed(body);
+            applyCurveMotion(body, dt, speedBeforeDamping);
+            body.x += body.vx * dt;
+            body.y += body.vy * dt;
+            double damping = Math.exp(-effectiveFriction(body, speedBeforeDamping) * dt);
+            body.vx *= damping;
+            body.vy *= damping;
+            double stopSpeed = "ball".equals(body.kind) ? BALL_STOP_SPEED : PLAYER_STOP_SPEED;
+            if (speed(body) < stopSpeed) {
+                body.vx = 0;
+                body.vy = 0;
+                activeCurves.remove(body.id);
+            }
+        }
+
+        private void applyCurveMotion(Body body, double dt, double speed) {
+            if (!"player".equals(body.kind) || speed <= 0) return;
+            CurveMotion curve = activeCurves.get(body.id);
+            if (curve == null) return;
+            double travel = Math.min(speed * dt, curve.remainingDistance);
+            if (travel <= 0) {
+                activeCurves.remove(body.id);
+                return;
+            }
+            double angleStep = curve.remainingAngle * (travel / curve.remainingDistance);
+            double cos = Math.cos(angleStep);
+            double sin = Math.sin(angleStep);
+            double vx = body.vx;
+            double vy = body.vy;
+            body.vx = vx * cos - vy * sin;
+            body.vy = vx * sin + vy * cos;
+            curve.remainingAngle -= angleStep;
+            curve.remainingDistance -= travel;
+            if (Math.abs(curve.remainingAngle) < 0.01 || curve.remainingDistance <= 1) {
+                activeCurves.remove(body.id);
+            }
+        }
+
+        private double effectiveFriction(Body body, double speed) {
+            double lowSpeed = "ball".equals(body.kind) ? BALL_LOW_SPEED_FRICTION_START : PLAYER_LOW_SPEED_FRICTION_START;
+            if (speed >= lowSpeed) return body.friction;
+            double tailFriction = "ball".equals(body.kind) ? BALL_TAIL_FRICTION : PLAYER_TAIL_FRICTION;
+            double slowFactor = 1 - speed / lowSpeed;
+            return body.friction + tailFriction * slowFactor * slowFactor;
+        }
+
+        private void resolveAllCollisions() {
+            List<Body> bodies = bodies();
+            for (int iteration = 0; iteration < SOLVER_ITERATIONS; iteration += 1) {
+                for (Body body : bodies) {
+                    collideArena(body);
+                }
+                for (int i = 0; i < bodies.size(); i += 1) {
+                    for (int j = i + 1; j < bodies.size(); j += 1) {
+                        collideBodies(bodies.get(i), bodies.get(j));
+                    }
+                }
+            }
+        }
+
+        private void collideArena(Body body) {
+            double left = -fieldWidth / 2 + body.radius;
+            double right = fieldWidth / 2 - body.radius;
+            boolean collided = false;
+            if (body.x < left) {
+                body.x = left;
+                body.vx = Math.abs(body.vx) * wallRestitution(body);
+                collided = true;
+            }
+            if (body.x > right) {
+                body.x = right;
+                body.vx = -Math.abs(body.vx) * wallRestitution(body);
+                collided = true;
+            }
+
+            double goalLineY = goalLineY();
+            double topLimit = bodyInsideGoalMouth(body) ? fieldHeight / 2 - body.radius : goalLineY - body.radius;
+            double bottomLimit = bodyInsideGoalMouth(body) ? -fieldHeight / 2 + body.radius : -goalLineY + body.radius;
+            if (body.y > topLimit) {
+                body.y = topLimit;
+                body.vy = -Math.abs(body.vy) * wallRestitution(body);
+                collided = true;
+            }
+            if (body.y < bottomLimit) {
+                body.y = bottomLimit;
+                body.vy = Math.abs(body.vy) * wallRestitution(body);
+                collided = true;
+            }
+            if (collideCornerCushions(body)) collided = true;
+            if (collided) activeCurves.remove(body.id);
+            if ("ball".equals(body.kind)) {
+                collideGoalPost(body, -GOAL_HALF_WIDTH, goalLineY);
+                collideGoalPost(body, GOAL_HALF_WIDTH, goalLineY);
+                collideGoalPost(body, -GOAL_HALF_WIDTH, -goalLineY);
+                collideGoalPost(body, GOAL_HALF_WIDTH, -goalLineY);
+            }
+        }
+
+        private void collideGoalPost(Body body, double x, double y) {
+            double postRadius = 5;
+            double dx = body.x - x;
+            double dy = body.y - y;
+            double min = body.radius + postRadius;
+            double dSq = dx * dx + dy * dy;
+            if (dSq >= min * min) return;
+            double d = Math.sqrt(dSq);
+            if (d < 0.0001) d = 0.0001;
+            double nx = dx / d;
+            double ny = dy / d;
+            body.x += nx * (min - d);
+            body.y += ny * (min - d);
+            double vn = body.vx * nx + body.vy * ny;
+            if (vn < 0) {
+                double bounce = 1 + wallRestitution(body);
+                body.vx -= bounce * vn * nx;
+                body.vy -= bounce * vn * ny;
+            }
+        }
+
+        private boolean collideCornerCushions(Body body) {
+            boolean collided = false;
+            double halfW = fieldWidth / 2;
+            double top = goalLineY();
+            double bottom = -goalLineY();
+            double[][] corners = {
+                    {-halfW, top, -1, 1},
+                    {halfW, top, 1, 1},
+                    {-halfW, bottom, -1, -1},
+                    {halfW, bottom, 1, -1}
+            };
+            for (double[] corner : corners) {
+                double dx = body.x - corner[0];
+                double dy = body.y - corner[1];
+                if (dx * corner[2] > 0 || dy * corner[3] > 0) continue;
+                double min = CORNER_CUSHION_RADIUS + body.radius;
+                double dSq = dx * dx + dy * dy;
+                if (dSq >= min * min) continue;
+                double d = Math.sqrt(dSq);
+                if (d < 0.0001) d = 0.0001;
+                double nx = dx / d;
+                double ny = dy / d;
+                body.x += nx * (min - d);
+                body.y += ny * (min - d);
+                double vn = body.vx * nx + body.vy * ny;
+                if (vn < 0) {
+                    double bounce = 1 + CORNER_CUSHION_RESTITUTION;
+                    body.vx -= bounce * vn * nx;
+                    body.vy -= bounce * vn * ny;
+                }
+                collided = true;
+            }
+            return collided;
+        }
+
+        private void collideBodies(Body a, Body b) {
+            double dx = b.x - a.x;
+            double dy = b.y - a.y;
+            double d = Math.sqrt(dx * dx + dy * dy);
+            double min = a.radius + b.radius;
+            if (d >= min) return;
+            if (d < 0.0001) {
+                d = 0.0001;
+                dx = 1;
+                dy = 0;
+            }
+            double nx = dx / d;
+            double ny = dy / d;
+            double invA = 1 / a.mass;
+            double invB = 1 / b.mass;
+            double invTotal = invA + invB;
+            double correction = (min - d) / invTotal;
+            a.x -= nx * correction * invA;
+            a.y -= ny * correction * invA;
+            b.x += nx * correction * invB;
+            b.y += ny * correction * invB;
+            activeCurves.remove(a.id);
+            activeCurves.remove(b.id);
+
+            double relVx = b.vx - a.vx;
+            double relVy = b.vy - a.vy;
+            double relNormalSpeed = relVx * nx + relVy * ny;
+            if (relNormalSpeed > 0) return;
+            double restitution = collisionRestitution(a, b);
+            double impulse = (-(1 + restitution) * relNormalSpeed) / invTotal;
+            a.vx -= impulse * invA * nx;
+            a.vy -= impulse * invA * ny;
+            b.vx += impulse * invB * nx;
+            b.vy += impulse * invB * ny;
+        }
+
+        private void checkGoal() {
+            if (goalLocked || Math.abs(ball.x) > GOAL_HALF_WIDTH - ball.radius) return;
+            if (ball.y > goalLineY() + ball.radius) {
+                scoreHome += 1;
+                stopBallInGoal();
+                goalLocked = true;
+            } else if (ball.y < -goalLineY() - ball.radius) {
+                scoreAway += 1;
+                stopBallInGoal();
+                goalLocked = true;
+            }
+        }
+
+        private void stopBallInGoal() {
+            ball.vx = 0;
+            ball.vy = 0;
+            activeCurves.remove(ball.id);
+        }
+
+        private SnapshotDto snapshot() {
+            List<BodyDto> playerDtos = players.stream().map(Body::dto).toList();
+            return new SnapshotDto(matchId, "online", fieldWidth, fieldHeight, tick, turn, new ScoreDto(scoreHome, scoreAway), playerDtos, ball.dto());
+        }
+
+        private ScoreDto score() {
+            return new ScoreDto(scoreHome, scoreAway);
+        }
+
+        private void setScore(int home, int away) {
+            scoreHome = Math.max(0, home);
+            scoreAway = Math.max(0, away);
+        }
+
+        private boolean isSettled() {
+            for (Body body : bodies()) {
+                if (Math.abs(body.vx) + Math.abs(body.vy) >= 1) return false;
+            }
+            return true;
+        }
+
+        private Body findBody(String id) {
+            for (Body body : players) {
+                if (body.id.equals(id)) return body;
+            }
+            if (ball.id.equals(id)) return ball;
+            return null;
+        }
+
+        private List<Body> bodies() {
+            List<Body> result = new ArrayList<>(players);
+            result.add(ball);
+            return result;
+        }
+
+        private double goalLineY() {
+            return fieldHeight / 2 - GOAL_DEPTH;
+        }
+
+        private boolean bodyInsideGoalMouth(Body body) {
+            return Math.abs(body.x) <= GOAL_HALF_WIDTH - body.radius;
+        }
+
+        private double wallRestitution(Body body) {
+            return "ball".equals(body.kind) ? 0.86 : 0.58;
+        }
+
+        private double collisionRestitution(Body a, Body b) {
+            if ("player".equals(a.kind) && "player".equals(b.kind)) return 0.98;
+            if (!a.kind.equals(b.kind)) return 0.88;
+            return Math.min(a.restitution, b.restitution);
+        }
+
+        private static Body makePlayer(String id, String side, double x, double y) {
+            return new Body(id, "player", side, x, y, PLAYER_RADIUS, PLAYER_MASS, PLAYER_FRICTION, PLAYER_RESTITUTION);
+        }
+
+        private static Body makeBall(double x, double y) {
+            return new Body("ball", "ball", null, x, y, BALL_RADIUS, BALL_MASS, BALL_FRICTION, BALL_RESTITUTION);
+        }
+
+        private static double speed(Body body) {
+            return Math.sqrt(body.vx * body.vx + body.vy * body.vy);
+        }
+    }
+
+    private static final class CurveMotion {
+        private double remainingAngle;
+        private double remainingDistance;
+
+        private CurveMotion(double remainingAngle, double remainingDistance) {
+            this.remainingAngle = remainingAngle;
+            this.remainingDistance = remainingDistance;
+        }
+    }
+
+    private record PointRatio(double x, double y) {
+    }
+
+    private record FieldSize(double width, double height) {
+    }
+
+    private static final class OnlineRuntimeMatch {
+        private final String matchId;
+        private final Long homeUserId;
+        private final String homeRequestId;
+        private final String homeUsername;
+        private final String homeFormationId;
+        private final List<PlayerSummary> homeLineup;
+        private final Long awayUserId;
+        private final String awayRequestId;
+        private final String awayUsername;
+        private final String awayFormationId;
+        private final List<PlayerSummary> awayLineup;
+        private final long startedAtMillis;
+        private final OnlineServerState serverState;
+        private final Map<String, OnlineActionState> pendingByCommandId = new HashMap<>();
+        private final Map<String, OnlineActionState> publishedByCommandId = new HashMap<>();
+        private final Map<String, FieldSize> fieldSizesByRequestId = new HashMap<>();
+        private final List<OnlineActionState> publishedActions = new ArrayList<>();
+        private long lastPublishedSeq = 0;
+        private int nextActionIndex = 1;
+        private int nextGoalOrder = 1;
+        private String turnNetworkSide = "home";
+        private long turnStartedAtMillis;
+        private boolean finished;
+        private String winnerNetworkSide;
+        private String loserNetworkSide;
+        private String finishMessage;
+        private boolean recordPersisted;
+
+        private OnlineRuntimeMatch(
+                String matchId,
+                Long homeUserId,
+                String homeRequestId,
+                String homeUsername,
+                String homeFormationId,
+                List<PlayerSummary> homeLineup,
+                Long awayUserId,
+                String awayRequestId,
+                String awayUsername,
+                String awayFormationId,
+                List<PlayerSummary> awayLineup,
+                long startedAtMillis
+        ) {
+            this.matchId = matchId;
+            this.homeUserId = homeUserId;
+            this.homeRequestId = homeRequestId;
+            this.homeUsername = homeUsername == null || homeUsername.isBlank() ? "home" : homeUsername;
+            this.homeFormationId = homeFormationId == null || homeFormationId.isBlank() ? "balanced-221" : homeFormationId;
+            this.homeLineup = homeLineup == null ? List.of() : List.copyOf(homeLineup);
+            this.awayUserId = awayUserId;
+            this.awayRequestId = awayRequestId;
+            this.awayUsername = awayUsername == null || awayUsername.isBlank() ? "away" : awayUsername;
+            this.awayFormationId = awayFormationId == null || awayFormationId.isBlank() ? "balanced-221" : awayFormationId;
+            this.awayLineup = awayLineup == null ? List.of() : List.copyOf(awayLineup);
+            this.startedAtMillis = startedAtMillis;
+            this.turnStartedAtMillis = startedAtMillis;
+            this.serverState = new OnlineServerState(matchId, this.homeFormationId, this.awayFormationId, DEFAULT_FIELD_WIDTH, DEFAULT_FIELD_HEIGHT);
+            this.serverState.resetObjects("home");
+            this.fieldSizesByRequestId.put(homeRequestId, canonicalFieldSize());
+            this.fieldSizesByRequestId.put(awayRequestId, canonicalFieldSize());
+        }
+
+        private boolean hasPlayer(long userId, String requestId) {
+            return (Long.valueOf(userId).equals(homeUserId) && homeRequestId.equals(requestId))
+                    || (Long.valueOf(userId).equals(awayUserId) && awayRequestId.equals(requestId));
+        }
+
+        private String networkSide(long userId, String requestId) {
+            return Long.valueOf(userId).equals(homeUserId) && homeRequestId.equals(requestId) ? "home" : "away";
+        }
+
+        private String opponentSide(String side) {
+            return "home".equals(side) ? "away" : "home";
+        }
+
+        private void updateFieldSize(String requestId, FieldSize size) {
+            String key = safeTextStatic(requestId);
+            if (key.isBlank() || size == null) return;
+            fieldSizesByRequestId.put(key, size);
+        }
+
+        private FieldSize fieldSizeForRequestId(String requestId) {
+            return fieldSizesByRequestId.getOrDefault(safeTextStatic(requestId), canonicalFieldSize());
+        }
+
+        private void advanceExpiredTurn(long now) {
+            if (!finished && now - startedAtMillis >= MATCH_DURATION_MILLIS) {
+                ScoreDto score = serverState.score();
+                if (score.home() > score.away()) {
+                    finishWithWinner("home", "比赛结束");
+                    return;
+                }
+                if (score.away() > score.home()) {
+                    finishWithWinner("away", "比赛结束");
+                    return;
+                }
+            }
+            if (awaitingConfirmation()) return;
+            while (now - turnStartedAtMillis >= TURN_DURATION_MILLIS) {
+                turnNetworkSide = opponentSide(turnNetworkSide);
+                serverState.turn = turnNetworkSide;
+                turnStartedAtMillis += TURN_DURATION_MILLIS;
+            }
+        }
+
+        private OnlineClockDto clock(long now, String targetNetworkSide) {
+            double matchRemaining = Math.max(0, (MATCH_DURATION_MILLIS - (now - startedAtMillis)) / 1000.0);
+            double turnRemaining = awaitingConfirmation() ? TURN_DURATION_MILLIS / 1000.0 : Math.max(0, (TURN_DURATION_MILLIS - (now - turnStartedAtMillis)) / 1000.0);
+            return new OnlineClockDto(now, matchRemaining, turnRemaining, localSide(turnNetworkSide, targetNetworkSide), !awaitingConfirmation());
+        }
+
+        private SnapshotDto localSnapshot(String targetNetworkSide) {
+            SnapshotDto canonical = serverState.snapshot();
+            return "away".equals(targetNetworkSide) ? OnlineMatchService.mirrorSnapshot(canonical) : canonical;
+        }
+
+        private String localWinnerSide(String targetNetworkSide) {
+            return winnerNetworkSide == null ? null : localSide(winnerNetworkSide, targetNetworkSide);
+        }
+
+        private String localLoserSide(String targetNetworkSide) {
+            return loserNetworkSide == null ? null : localSide(loserNetworkSide, targetNetworkSide);
+        }
+
+        private ScoreDto localFinishScore(String targetNetworkSide) {
+            return OnlineMatchService.localScore(OnlineMatchService.finishScoreOrNull(this), targetNetworkSide);
+        }
+
+        private int nextActionIndex() {
+            int value = nextActionIndex;
+            nextActionIndex += 1;
+            return value;
+        }
+
+        private int nextGoalOrder() {
+            int value = nextGoalOrder;
+            nextGoalOrder += 1;
+            return value;
+        }
+
+        private long userIdForSide(String side) {
+            return "away".equals(side) ? awayUserId : homeUserId;
+        }
+
+        private String usernameForSide(String side) {
+            return "away".equals(side) ? awayUsername : homeUsername;
+        }
+
+        private String playerIdForActor(String actorId) {
+            int slot = slotIndex(actorId);
+            if (slot < 0) return "";
+            List<PlayerSummary> lineup = actorId != null && actorId.startsWith("away-") ? awayLineup : homeLineup;
+            if (slot >= lineup.size()) return "";
+            return lineup.get(slot).id();
+        }
+
+        private String playerNameForId(String side, String playerId) {
+            List<PlayerSummary> lineup = "away".equals(side) ? awayLineup : homeLineup;
+            for (PlayerSummary player : lineup) {
+                if (player.id().equals(playerId)) return player.name();
+            }
+            return playerId == null ? "" : playerId;
+        }
+
+        private boolean awaitingConfirmation() {
+            return pendingByCommandId.values().stream().anyMatch(action -> !action.confirmed);
+        }
+
+        private boolean actionFullyConfirmed(OnlineActionState action) {
+            return action.confirmedRequestIds.contains(homeRequestId) && action.confirmedRequestIds.contains(awayRequestId);
+        }
+
+        private void expireResultTimeouts(long now) {
+            if (finished) return;
+            for (OnlineActionState action : pendingByCommandId.values()) {
+                if (!action.confirmedRequestIds.contains(action.actorRequestId) && now - action.createdAtMillis > RESULT_CONFIRM_TIMEOUT_MILLIS) {
+                    finishWithLoser(action.actorNetworkSide, "操作结算超时");
+                    return;
+                }
+                String receiverSide = opponentSide(action.actorNetworkSide);
+                String receiverRequestId = "home".equals(receiverSide) ? homeRequestId : awayRequestId;
+                if (!action.confirmedRequestIds.contains(receiverRequestId) && now - action.createdAtMillis > RESULT_CONFIRM_TIMEOUT_MILLIS) {
+                    finishWithLoser(receiverSide, "同步对方操作超时");
+                    return;
+                }
+            }
+        }
+
+        private void finishWithLoser(String loserSide, String message) {
+            if (finished) return;
+            loserNetworkSide = "away".equals(loserSide) ? "away" : "home";
+            winnerNetworkSide = opponentSide(loserNetworkSide);
+            finishMessage = message == null || message.isBlank() ? "联机同步失败" : message;
+            finished = true;
+        }
+
+        private void finishWithWinner(String winnerSide, String message) {
+            if (finished) return;
+            winnerNetworkSide = "away".equals(winnerSide) ? "away" : "home";
+            loserNetworkSide = opponentSide(winnerNetworkSide);
+            finishMessage = message == null || message.isBlank() ? "比赛结束" : message;
+            finished = true;
+        }
+
+        private ActionResponse finishedActionResponse(long now, String targetNetworkSide) {
+            return new ActionResponse(false, finishMessage, List.of(), lastPublishedSeq, clock(now, targetNetworkSide), localWinnerSide(targetNetworkSide), localLoserSide(targetNetworkSide), localFinishScore(targetNetworkSide));
+        }
+
+        private ResultResponse finishedResultResponse(long now, String targetNetworkSide) {
+            return new ResultResponse(false, false, false, finishMessage, clock(now, targetNetworkSide), localWinnerSide(targetNetworkSide), localLoserSide(targetNetworkSide), localFinishScore(targetNetworkSide));
+        }
+
+    }
+
+    private static final class OnlineActionState {
+        private long seq;
+        private final Long actorUserId;
+        private final String actorRequestId;
+        private final String actorNetworkSide;
+        private final OnlineShootCommandDto command;
+        private final ScoreDto scoreBefore;
+        private final long createdAtMillis;
+        private boolean published;
+        private long publishedAtMillis;
+        private final SnapshotDto expectedSnapshot;
+        private boolean confirmed;
+        private final Set<String> confirmedRequestIds = new HashSet<>();
+
+        private OnlineActionState(Long actorUserId, String actorRequestId, String actorNetworkSide, OnlineShootCommandDto command, ScoreDto scoreBefore, SnapshotDto expectedSnapshot, long createdAtMillis) {
+            this.actorUserId = actorUserId;
+            this.actorRequestId = actorRequestId;
+            this.actorNetworkSide = actorNetworkSide;
+            this.command = command;
+            this.scoreBefore = scoreBefore;
+            this.expectedSnapshot = expectedSnapshot;
+            this.createdAtMillis = createdAtMillis;
+        }
+
+        private String expectedGoalSide() {
+            ScoreDto after = expectedSnapshot == null ? null : expectedSnapshot.score();
+            if (scoreBefore == null || after == null) return "";
+            if (after.home() > scoreBefore.home()) return "home";
+            if (after.away() > scoreBefore.away()) return "away";
+            return "";
+        }
+    }
+
+    private static final class SettlementPlayerGoalCount {
+        private final long userId;
+        private final String username;
+        private final String side;
+        private final String actorId;
+        private final String playerId;
+        private final String playerName;
+        private int goals;
+        private int firstOrder;
+
+        private SettlementPlayerGoalCount(SettlementGoalDto goal) {
+            this.userId = goal.userId();
+            this.username = goal.username();
+            this.side = goal.side();
+            this.actorId = goal.actorId();
+            this.playerId = goal.playerId();
+            this.playerName = goal.playerName();
+            this.goals = 0;
+            this.firstOrder = goal.order();
+        }
+
+        private int goals() {
+            return goals;
+        }
+
+        private int firstOrder() {
+            return firstOrder;
+        }
+
+        private BestPlayerDto toDto() {
+            return new BestPlayerDto(userId, username, side, actorId, playerId, playerName, goals);
+        }
+    }
+
+    private static List<PointRatio> ratios(double... values) {
+        List<PointRatio> result = new ArrayList<>();
+        for (int i = 0; i + 1 < values.length; i += 2) {
+            result.add(new PointRatio(values[i], values[i + 1]));
+        }
+        return result;
+    }
+
+    private static double round(double value) {
+        return Math.round(value * 1000.0) / 1000.0;
+    }
+}

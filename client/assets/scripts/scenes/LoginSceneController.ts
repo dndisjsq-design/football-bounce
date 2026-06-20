@@ -7,8 +7,10 @@ import { setAuthMessage } from './AuthSceneHelpers';
 export function bindLoginScene(root: Node): void {
   const usernameInput = ensureEditBox(root, 'InputAccount', '', false);
   const passwordInput = ensureEditBox(root, 'InputPassword', '', true);
+  let manualLoginStarted = false;
   setAuthMessage(root, 'TextHint', '');
   void tryAutoLogin().then((response) => {
+    if (manualLoginStarted) return;
     if (!response) return;
     if (response.code === 'SUCCESS') {
       director.loadScene('Home');
@@ -20,10 +22,12 @@ export function bindLoginScene(root: Node): void {
   });
   onTapExpanded(root, 'ButtonRegister', 16, 12, () => director.loadScene('Register'));
   onTap(root, 'ButtonGuestLogin', () => {
+    manualLoginStarted = true;
     startGuestLogin();
     director.loadScene('Home');
   });
   onTap(root, 'ButtonLogin', () => {
+    manualLoginStarted = true;
     const username = (usernameInput?.string || '').trim();
     const password = passwordInput?.string || '';
     if (!username || !password) {

@@ -47,6 +47,18 @@ public class LineupService {
         if (userId == null) return;
         lineupMapper.insertOwnedPlayersByRarity(userId, "blue");
         for (int i = 0; i < DEFAULT_FORMATION_IDS.size(); i += 1) lineupMapper.insertOwnedFormationIfAbsent(userId, DEFAULT_FORMATION_IDS.get(i), i);
+        List<String> playerIds = lineupMapper.findTopOwnedPlayerIds(userId, 5);
+        if (playerIds.size() >= 5) {
+            UserLineup lineup = new UserLineup();
+            lineup.setUserId(userId);
+            lineup.setSelectedFormationId("defense-311");
+            lineup.setSlot1PlayerId(playerIds.get(0));
+            lineup.setSlot2PlayerId(playerIds.get(1));
+            lineup.setSlot3PlayerId(playerIds.get(2));
+            lineup.setSlot4PlayerId(playerIds.get(3));
+            lineup.setSlot5PlayerId(playerIds.get(4));
+            lineupMapper.upsertLineup(lineup);
+        }
     }
 
     private LineupStateResponse buildState(Long userId) {

@@ -41,6 +41,8 @@ public final class SingleMatchDtos {
     public record SnapshotDto(
             String matchId,
             String mode,
+            Double fieldWidth,
+            Double fieldHeight,
             long tick,
             String turn,
             ScoreDto score,
@@ -58,6 +60,8 @@ public final class SingleMatchDtos {
             double power,
             Double curveAngleRad,
             Double curveDistance,
+            Double fieldWidth,
+            Double fieldHeight,
             Long clientTick
     ) {
     }

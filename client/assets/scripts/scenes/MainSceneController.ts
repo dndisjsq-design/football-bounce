@@ -1,8 +1,9 @@
-import { Color, director, EventTouch, Graphics, Label, Mask, MaskType, Node, Sprite, UITransform } from 'cc';
+import { Button, Color, director, EventTouch, Graphics, Label, Mask, MaskType, Node, Sprite, UITransform } from 'cc';
 import { MatchMode } from '../MatchTypes';
 import { getCurrentUserSummary, logoutCurrentDevice, onUserSummaryChange } from '../services/AuthService';
 import type { UserSummary } from '../services/AuthService';
 import { MatchRecordSummary, fetchRecentMatchRecords, setSelectedReplayMatchId } from '../services/MatchRecordService';
+import { OnlineMatchmakingResponse, cancelOnlineMatch, createMatchmakingRequestId, fetchOnlineMatchStatus, joinOnlineMatch, setSelectedOnlineMatch } from '../services/OnlineMatchService';
 import { getCurrentCoins } from '../services/WalletService';
 import { findNode, onTap, rgba } from '../utils/CocosNodeUtils';
 
@@ -12,6 +13,7 @@ const HEADER_COIN_Y = 393;
 export function bindHomeScene(root: Node, selectMatchMode: (mode: MatchMode) => void): void {
   bindTabs(root, 'home');
   bindMatchRecordButton(root);
+  bindOnlineMatchButton(root, selectMatchMode);
   onTap(root, 'ButtonAI', () => {
     selectMatchMode('ai');
     director.loadScene('Match');
@@ -102,6 +104,221 @@ function createHeaderCoinNode(root: Node): Node {
   node.layer = root.layer;
   root.addChild(node);
   return node;
+}
+
+function bindOnlineMatchButton(root: Node, selectMatchMode: (mode: MatchMode) => void): void {
+  const button = findNode(root, 'ButtonOnline');
+  if (!button) return;
+  const buttonComponent = button.getComponent(Button);
+  if (buttonComponent) buttonComponent.interactable = true;
+  button.off(Node.EventType.TOUCH_END);
+  onTap(root, 'ButtonOnline', () => showMatchmakingOverlay(root, selectMatchMode));
+}
+
+function showMatchmakingOverlay(root: Node, selectMatchMode: (mode: MatchMode) => void): void {
+  const old = findNode(root, 'OnlineMatchmakingOverlay');
+  if (old) old.destroy();
+  const overlay = new Node('OnlineMatchmakingOverlay');
+  overlay.layer = root.layer;
+  root.addChild(overlay);
+  const size = root.getComponent(UITransform)?.contentSize;
+  const width = size?.width || 390;
+  const height = size?.height || 844;
+  overlay.addComponent(UITransform).setContentSize(width, height);
+  overlay.setPosition(0, 0);
+  const bg = overlay.addComponent(Graphics);
+  drawMatchmakingBackground(bg, width, height);
+  const leftSlot = createMatchmakingSlot(overlay, 'MatchmakingLeftSlot', -width * 0.25, 66, 148, 250, rgba(238, 77, 77));
+  const rightSlot = createMatchmakingSlot(overlay, 'MatchmakingRightSlot', width * 0.25, 66, 148, 250, rgba(74, 135, 232));
+  const statusLabel = createRuntimeLabel(overlay, 'MatchmakingStatus', '匹配中', 0, -255, 22, rgba(255, 255, 255), Label.HorizontalAlign.CENTER, 220, 34);
+  statusLabel.isBold = true;
+  const spinner = createSpinner(overlay, 0, -196);
+  const back = createMatchmakingBackButton(overlay, -width / 2 + 54, height / 2 - 48);
+  const requestId = createMatchmakingRequestId();
+  let active = true;
+  let spinnerAngle = 0;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let spinTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
+    if (!active || !spinner.isValid) return;
+    spinnerAngle = (spinnerAngle - 26) % 360;
+    spinner.setRotationFromEuler(0, 0, spinnerAngle);
+  }, 50);
+
+  const cleanup = () => {
+    active = false;
+    if (pollTimer) clearInterval(pollTimer);
+    if (spinTimer) clearInterval(spinTimer);
+    pollTimer = null;
+    spinTimer = null;
+  };
+  const handle = (response: OnlineMatchmakingResponse) => {
+    if (!active || !overlay.isValid) return;
+    renderMatchmakingSlots(leftSlot, rightSlot, response);
+    if (!response.ok || response.status === 'ERROR') {
+      statusLabel.string = response.message || '匹配失败';
+      spinner.active = false;
+      cleanup();
+      return;
+    }
+    if (response.status === 'MATCHED' && response.matchId) {
+      cleanup();
+      spinner.active = false;
+      statusLabel.string = '匹配成功';
+      setSelectedOnlineMatch(response);
+      setTimeout(() => {
+        if (!overlay.isValid) return;
+        selectMatchMode('online');
+        director.loadScene('Match');
+      }, 2000);
+      return;
+    }
+    if (response.status === 'EXPIRED') {
+      statusLabel.string = '匹配超时';
+      spinner.active = false;
+      cleanup();
+      return;
+    }
+    if (response.status === 'CANCELLED') {
+      cleanup();
+      if (overlay.isValid) overlay.destroy();
+      return;
+    }
+    statusLabel.string = response.message || '匹配中';
+  };
+  back.on(Node.EventType.TOUCH_END, () => {
+    cleanup();
+    void cancelOnlineMatch(requestId).catch(() => undefined);
+    overlay.destroy();
+  });
+  void joinOnlineMatch(requestId)
+    .then((response) => {
+      handle(response);
+      if (!active || response.status === 'MATCHED') return;
+      pollTimer = setInterval(() => {
+        void fetchOnlineMatchStatus(requestId).then(handle).catch(() => {
+          if (statusLabel.isValid) statusLabel.string = '等待后端连接';
+        });
+      }, 800);
+    })
+    .catch((error: Error) => {
+      statusLabel.string = error.message || '无法连接后端';
+      spinner.active = false;
+      cleanup();
+    });
+}
+
+function drawMatchmakingBackground(g: Graphics, width: number, height: number): void {
+  g.clear();
+  g.fillColor = rgba(190, 34, 46, 255);
+  g.rect(-width / 2, -height / 2, width / 2, height);
+  g.fill();
+  g.fillColor = rgba(28, 89, 196, 255);
+  g.rect(0, -height / 2, width / 2, height);
+  g.fill();
+  g.fillColor = rgba(255, 255, 255, 42);
+  g.rect(-1.5, -height / 2, 3, height);
+  g.fill();
+  g.fillColor = rgba(7, 18, 42, 72);
+  g.rect(-width / 2, -height / 2, width, height);
+  g.fill();
+  createRuntimeLabel(g.node, 'MatchmakingTitle', '真人联机', 0, height / 2 - 72, 30, rgba(255, 255, 255), Label.HorizontalAlign.CENTER, 240, 42).isBold = true;
+}
+
+function createMatchmakingSlot(parent: Node, name: string, x: number, y: number, width: number, height: number, color: Color): Node {
+  const slot = new Node(name);
+  slot.layer = parent.layer;
+  parent.addChild(slot);
+  slot.setPosition(x, y);
+  slot.addComponent(UITransform).setContentSize(width, height);
+  const g = slot.addComponent(Graphics);
+  g.fillColor = rgba(255, 255, 255, 28);
+  g.roundRect(-width / 2, -height / 2, width, height, 8);
+  g.fill();
+  g.strokeColor = color;
+  g.lineWidth = 2;
+  g.roundRect(-width / 2, -height / 2, width, height, 8);
+  g.stroke();
+  return slot;
+}
+
+function renderMatchmakingSlots(leftSlot: Node, rightSlot: Node, response: OnlineMatchmakingResponse): void {
+  renderMatchmakingPlayer(leftSlot, response.leftPlayer || null, rgba(238, 77, 77), '等待玩家');
+  renderMatchmakingPlayer(rightSlot, response.rightPlayer || null, rgba(74, 135, 232), '等待对手');
+}
+
+function renderMatchmakingPlayer(slot: Node, player: OnlineMatchmakingResponse['leftPlayer'] | null, color: Color, emptyText: string): void {
+  slot.removeAllChildren();
+  const g = slot.getComponent(Graphics) || slot.addComponent(Graphics);
+  g.clear();
+  const transform = slot.getComponent(UITransform);
+  const width = transform?.contentSize.width || 148;
+  const height = transform?.contentSize.height || 250;
+  g.fillColor = rgba(255, 255, 255, 30);
+  g.roundRect(-width / 2, -height / 2, width, height, 8);
+  g.fill();
+  g.strokeColor = color;
+  g.lineWidth = 2.2;
+  g.roundRect(-width / 2, -height / 2, width, height, 8);
+  g.stroke();
+  if (!player) {
+    createRuntimeLabel(slot, 'EmptyPlayer', emptyText, 0, 0, 18, rgba(231, 238, 255), Label.HorizontalAlign.CENTER, 120, 28);
+    return;
+  }
+  drawMatchmakingAvatar(g, 0, 44, 37, color);
+  const name = player.displayName || player.username || '玩家';
+  createRuntimeLabel(slot, 'PlayerName', name, 0, -24, 18, rgba(255, 255, 255), Label.HorizontalAlign.CENTER, 124, 30).isBold = true;
+}
+
+function drawMatchmakingAvatar(g: Graphics, x: number, y: number, radius: number, color: Color): void {
+  g.fillColor = rgba(255, 255, 255, 235);
+  g.circle(x, y, radius + 5);
+  g.fill();
+  g.fillColor = color;
+  g.circle(x, y, radius);
+  g.fill();
+  g.fillColor = rgba(255, 224, 176, 255);
+  g.circle(x, y + 4, radius * 0.56);
+  g.fill();
+  g.fillColor = rgba(32, 40, 54, 235);
+  g.circle(x - radius * 0.19, y + 6, 3);
+  g.circle(x + radius * 0.19, y + 6, 3);
+  g.fill();
+}
+
+function createSpinner(parent: Node, x: number, y: number): Node {
+  const node = new Node('MatchmakingSpinner');
+  node.layer = parent.layer;
+  parent.addChild(node);
+  node.setPosition(x, y);
+  node.addComponent(UITransform).setContentSize(58, 58);
+  const g = node.addComponent(Graphics);
+  g.strokeColor = rgba(255, 255, 255, 238);
+  g.lineWidth = 5;
+  const radius = 22;
+  for (let i = 0; i < 22; i += 1) {
+    const start = -Math.PI * 0.15 + i * Math.PI * 1.42 / 22;
+    const end = start + Math.PI * 0.035;
+    const alpha = 80 + i * 7;
+    g.strokeColor = rgba(255, 255, 255, alpha);
+    g.moveTo(Math.cos(start) * radius, Math.sin(start) * radius);
+    g.lineTo(Math.cos(end) * radius, Math.sin(end) * radius);
+    g.stroke();
+  }
+  return node;
+}
+
+function createMatchmakingBackButton(parent: Node, x: number, y: number): Node {
+  const button = new Node('MatchmakingBack');
+  button.layer = parent.layer;
+  parent.addChild(button);
+  button.setPosition(x, y);
+  button.addComponent(UITransform).setContentSize(72, 38);
+  const g = button.addComponent(Graphics);
+  g.fillColor = rgba(255, 255, 255, 235);
+  g.roundRect(-36, -19, 72, 38, 5);
+  g.fill();
+  createRuntimeLabel(button, 'BackLabel', '返回', 0, 0, 15, rgba(32, 44, 64), Label.HorizontalAlign.CENTER, 58, 22).isBold = true;
+  return button;
 }
 
 function bindMatchRecordButton(root: Node): void {

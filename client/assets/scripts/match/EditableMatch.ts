@@ -1,6 +1,6 @@
 import { Color, director, EventTouch, Graphics, Label, Node, Sprite, Touch, UITransform, Vec2, Vec3 } from 'cc';
-import { MatchTransport } from '../MatchTransport';
-import { BallState, DiscBodyState, MatchEvent, MatchMode, MatchSnapshot, PlayerDiskState, ShootCommand, TeamSide } from '../MatchTypes';
+import type { MatchSettlementPreview, MatchTransport } from '../MatchTransport';
+import { BallState, DiscBodyState, MatchEvent, MatchMode, MatchSnapshot, PlayerDiskState, ScoreState, ShootCommand, TeamSide } from '../MatchTypes';
 import { getCurrentUserDisplayName } from '../services/AuthService';
 import { getMatchFormationPoints, getMatchFormationPointsById } from '../services/FormationService';
 import { RosterPlayer, getLineupPlayers } from '../services/PlayerRosterService';
@@ -16,6 +16,8 @@ import {
   MatchSettlement,
 } from '../services/SingleMatchService';
 import { MatchActionRecord, MatchReplayData, fetchMatchReplay, parseShootCommand } from '../services/MatchRecordService';
+import type { OnlineMatchmakingResponse } from '../services/OnlineMatchService';
+import { fetchOnlineSettlement } from '../services/OnlineMatchService';
 import { findNode, rgba } from '../utils/CocosNodeUtils';
 
 const MATCH_ID = 'editable-scene-preview';
@@ -143,12 +145,21 @@ export class EditableMatch {
   private replayActionIndex = 0;
   private replayDelay = 0.35;
   private replayFinished = false;
+  private onlineMatch: OnlineMatchmakingResponse | null = null;
+  private onlineInitialTurn: TeamSide = 'home';
+  private onlineControlEnabled = false;
+  private pendingOnlineFinishSide: TeamSide | null = null;
+  private pendingOnlineFinalScore: ScoreState | null = null;
+  private onlineSettlementInFlight = false;
+  private onlineSettlementNextRetryAt = 0;
+  private onlineInitialSnapshot: MatchSnapshot | null = null;
 
-  constructor(canvas: Node, mode: MatchMode, transport: MatchTransport, replayMatchId = '') {
+  constructor(canvas: Node, mode: MatchMode, transport: MatchTransport, replayMatchId = '', onlineMatch: OnlineMatchmakingResponse | null = null) {
     this.canvas = canvas;
     this.mode = mode;
     this.transport = transport;
     this.replayMatchId = replayMatchId;
+    this.onlineMatch = onlineMatch;
   }
 
   start(): void {
@@ -160,19 +171,27 @@ export class EditableMatch {
       void this.startReplayFromServer();
       return;
     }
-    this.transport.onRemoteShoot((command) => this.applyShoot(command));
+    if (this.mode === 'online') this.applyOnlineMatchData();
+    this.transport.onRemoteShoot((command) => this.applyShootWithFastSettlement(command));
     this.transport.onSnapshot((snapshot) => this.applySnapshot(snapshot));
-    void this.transport.connect(MATCH_ID).catch(() => undefined);
+    this.transport.onClock((clock) => this.applyServerClock(clock.matchRemainingSeconds, clock.turnRemainingSeconds, clock.turn, clock.controlEnabled === true));
+    this.transport.onServerForfeit((message, finalScore) => this.forceServerForfeit(message, finalScore || null));
+    this.transport.onServerVictory((message, finalScore) => this.forceServerVictory(message, finalScore || null));
+    this.transport.setFieldSizeProvider(() => ({ fieldWidth: this.fieldWidth, fieldHeight: this.fieldHeight }));
     this.prepareMatchHud();
     if (this.mode === 'ai') {
       this.hideRuntimeMatchObjects();
       void this.startSinglePlayerFromServer();
       return;
     }
-    this.resetObjects();
+    this.resetObjects(this.onlineInitialLocalTurn());
+    if (this.mode === 'online' && this.onlineInitialSnapshot) {
+      this.applySnapshot(this.onlineInitialSnapshot);
+    }
     this.prepareMatchRenderer();
     this.attachPlayerInput();
     this.syncNodes();
+    void this.transport.connect(this.activeMatchId).catch(() => undefined);
   }
 
   tick(dt: number): void {
@@ -198,7 +217,13 @@ export class EditableMatch {
     this.tickIndex += 1;
     this.flushSingleMatchSettlementValidation();
     this.flushSingleMatchFinish();
-    if (this.tickIndex % 12 === 0) void this.transport.submitSnapshot(this.createSnapshot()).catch(() => undefined);
+    this.flushOnlineMatchSettlement();
+    if (this.mode === 'online' && this.pendingOnlineFinishSide && this.goalCelebrationRemaining <= 0 && !this.matchEnded && this.isSettled()) {
+      this.startOnlineFinishAnimation();
+    }
+    if (this.mode !== 'online' && !this.matchEnded && this.goalCelebrationRemaining <= 0 && this.tickIndex % 12 === 0) {
+      void this.transport.submitSnapshot(this.createSnapshot()).catch(() => undefined);
+    }
     this.syncNodes();
   }
 
@@ -244,7 +269,7 @@ export class EditableMatch {
       this.singleMatchAwayFormationId = response.record.awayFormationId || response.record.homeFormationId;
       this.singleMatchHomeLineup = normalizeLineup(response.homeLineup);
       this.singleMatchAwayLineup = normalizeLineup(response.awayLineup || response.homeLineup);
-      this.resetObjects('home');
+      this.resetObjects(this.firstReplayTurn(response.actions));
       this.prepareMatchHud();
       this.setReplayHudLabels(response);
       this.prepareMatchRenderer();
@@ -273,10 +298,10 @@ export class EditableMatch {
     this.physicsAccumulator = 0;
     this.ball = makeBall(0, 0);
     this.ballSpinDeg = 0;
-    const homePoints = this.mode === 'ai' && this.singleMatchHomeFormationId
+    const homePoints = this.usesServerLineup() && this.singleMatchHomeFormationId
       ? getMatchFormationPointsById(this.singleMatchHomeFormationId, 'home', fw, fh)
       : getMatchFormationPoints('home', fw, fh);
-    const awayPoints = this.mode === 'ai' && this.singleMatchAwayFormationId
+    const awayPoints = this.usesServerLineup() && this.singleMatchAwayFormationId
       ? getMatchFormationPointsById(this.singleMatchAwayFormationId, 'away', fw, fh)
       : getMatchFormationPoints('away', fw, fh);
     this.players = [
@@ -319,15 +344,22 @@ export class EditableMatch {
     while (this.replayActionIndex < this.replayActions.length) {
       const action = this.replayActions[this.replayActionIndex];
       this.replayActionIndex += 1;
-      if (action.actionType === 'shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty' || action.actionType === 'event-goal' || action.actionType === 'kickoff-reset' || action.actionType === 'finish') {
+      if (action.actionType === 'shoot' || action.actionType === 'online-shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty' || action.actionType === 'event-goal' || action.actionType === 'kickoff-reset' || action.actionType === 'finish') {
         return action;
       }
     }
     return null;
   }
 
+  private firstReplayTurn(actions: MatchActionRecord[]): TeamSide {
+    const firstShoot = actions.find((action) => action.validResult !== false
+      && (action.actionType === 'shoot' || action.actionType === 'online-shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty')
+      && (action.actorSide === 'home' || action.actorSide === 'away'));
+    return firstShoot?.actorSide === 'away' ? 'away' : 'home';
+  }
+
   private applyReplayAction(action: MatchActionRecord): void {
-    if (action.actionType === 'shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty') {
+    if (action.actionType === 'shoot' || action.actionType === 'online-shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty') {
       const command = parseShootCommand(action);
       if (!command) return;
       this.applyShoot({ ...command, matchId: this.activeMatchId });
@@ -378,7 +410,7 @@ export class EditableMatch {
     const width = this.canvas.getComponent(UITransform)?.contentSize.width || 390;
     const pitchTop = this.pitchTopY();
     this.createHudLabel(hud, 'HudHomeName', this.matchDisplayName(), -width / 2 + 76, pitchTop + 23, 14, rgba(255, 255, 255), Label.HorizontalAlign.LEFT);
-    this.createHudLabel(hud, 'HudAwayName', this.mode === 'ai' ? '电脑' : '对手', width / 2 - 76, pitchTop + 23, 14, rgba(255, 255, 255), Label.HorizontalAlign.RIGHT);
+    this.createHudLabel(hud, 'HudAwayName', this.opponentDisplayName(), width / 2 - 76, pitchTop + 23, 14, rgba(255, 255, 255), Label.HorizontalAlign.RIGHT);
     this.createHudLabel(hud, 'HudModeName', this.mode === 'ai' ? '单机人机' : '真人联机', width / 2 - 40, pitchTop + 56, 13, rgba(255, 255, 255), Label.HorizontalAlign.RIGHT)
       .node.getComponent(UITransform)?.setContentSize(92, 22);
     this.createHudLabel(hud, 'HudMatchTime', formatClock(this.matchRemaining), 0, pitchTop + 25, 22, rgba(255, 246, 178), Label.HorizontalAlign.CENTER)
@@ -478,6 +510,7 @@ export class EditableMatch {
         this.beginPenaltyKeeperSwipe(event);
         const current = this.players.find((p) => p.id === playerId);
         if (this.matchEnded || this.goalCelebrationRemaining > 0 || !current || current.side !== 'home' || this.turn !== 'home' || !this.isSettled()) return;
+        if (this.mode === 'online' && !this.onlineControlEnabled) return;
         if (this.penaltyShootout && (!this.penaltyAttackerReady || current.id !== this.currentPenaltyKickerId)) return;
         this.dragActor = current;
         this.dragStart = new Vec2(current.x, current.y);
@@ -601,6 +634,8 @@ export class EditableMatch {
         power,
         curveAngleRad,
         curveDistance,
+        fieldWidth: this.fieldWidth,
+        fieldHeight: this.fieldHeight,
         clientTick: Date.now(),
       });
     }
@@ -608,8 +643,9 @@ export class EditableMatch {
   }
 
   private submitShoot(command: ShootCommand): void {
-    const normalized = { ...command, matchId: this.activeMatchId };
-    this.applyShoot(normalized);
+    const normalized = { ...command, matchId: this.activeMatchId, fieldWidth: this.fieldWidth, fieldHeight: this.fieldHeight };
+    const applied = this.applyShoot(normalized);
+    if (!applied) return;
     if (this.mode === 'ai') {
       if (!this.singleMatchServerReady) {
         this.forceServerForfeit('后端未连接，单人比赛无法校验');
@@ -626,20 +662,27 @@ export class EditableMatch {
         .catch(() => this.forceServerForfeit('用户操作无法发送到后端'));
       return;
     }
-    void this.transport.submitShoot(normalized).catch(() => undefined);
+    const fastSettlement = this.createFastSettlementPreview();
+    void this.transport.submitShoot(normalized, fastSettlement).catch(() => undefined);
   }
 
-  private applyShoot(command: ShootCommand): void {
-    if (this.appliedCommandIds.has(command.commandId)) return;
+  private applyShootWithFastSettlement(command: ShootCommand): boolean | MatchSettlementPreview {
+    const applied = this.applyShoot(command);
+    if (!applied) return false;
+    return this.createFastSettlementPreview();
+  }
+
+  private applyShoot(command: ShootCommand): boolean {
+    if (this.appliedCommandIds.has(command.commandId)) return true;
     const actor = this.players.find((p) => p.id === command.actorId);
-    if (!actor || actor.side !== command.side || command.side !== this.turn || !this.isSettled()) return;
-    if (this.penaltyShootout && (!this.penaltyAttackerReady || actor.id !== this.currentPenaltyKickerId)) return;
+    if (!actor || actor.side !== command.side || command.side !== this.turn || !this.isSettled()) return false;
+    if (this.penaltyShootout && (!this.penaltyAttackerReady || actor.id !== this.currentPenaltyKickerId)) return false;
     this.appliedCommandIds.add(command.commandId);
     const curveAngle = clamp(command.curveAngleRad || 0, -MAX_CURVE_ANGLE, MAX_CURVE_ANGLE);
     const curveDistance = Math.max(0, command.curveDistance || 0);
     const hasCurve = Math.abs(curveAngle) > 0.03 && curveDistance > CURVE_MIN_DISTANCE;
     const shotAngle = command.angleRad + (hasCurve ? curveAngle : 0);
-    const speed = PLAYER_SHOT_SPEED * clamp(command.power, 0, 1);
+    const speed = PLAYER_SHOT_SPEED * Math.max(0, command.power);
     actor.vx = Math.cos(shotAngle) * speed;
     actor.vy = Math.sin(shotAngle) * speed;
     this.physicsAccumulator = 0;
@@ -660,7 +703,9 @@ export class EditableMatch {
       this.turn = this.turn === 'home' ? 'away' : 'home';
       this.turnRemaining = TURN_SECONDS;
     }
+    if (this.mode === 'online') this.onlineControlEnabled = false;
     this.emitMatchEvent({ type: 'shoot', side: command.side, actorId: actor.id });
+    return true;
   }
 
   private fireAi(): void {
@@ -678,7 +723,8 @@ export class EditableMatch {
       .then((response) => {
         if (!response.ok || !response.command) return;
         if (!this.penaltyShootout) this.singleMatchValidationPending = true;
-        this.applyShoot({ ...response.command, matchId: this.activeMatchId });
+        const command = { ...response.command, matchId: this.activeMatchId };
+        this.applyShoot(command);
       })
       .catch(() => undefined)
       .then(() => {
@@ -905,19 +951,20 @@ export class EditableMatch {
   }
 
   private registerGoal(side: TeamSide): void {
-    this.score[side] += 1;
-    this.stopBallInGoal();
     const actorId = this.lastShotActorId || `${side}-1`;
     const ownGoal = !!this.lastShotActorId && !this.lastShotActorId.startsWith(side);
+    this.score[side] += 1;
+    this.stopBallInGoal();
     this.emitMatchEvent({ type: 'goal', side, actorId, matchSecond: Math.round(MATCH_SECONDS - this.matchRemaining), penalty: false, ownGoal });
     this.goalScorer = side;
     this.pendingKickoffTurn = side === 'home' ? 'away' : 'home';
     this.goalCelebrationRemaining = GOAL_CELEBRATION_SECONDS;
     this.goalCelebrationElapsed = 0;
-    this.celebrationKind = this.score[side] >= WIN_SCORE ? 'matchEnd' : 'goal';
+    const reachedWinScore = this.score[side] >= WIN_SCORE;
+    this.celebrationKind = reachedWinScore && this.mode !== 'online' ? 'matchEnd' : 'goal';
     this.clearDragAim();
     this.singleMatchValidationPending = false;
-    if (this.score[side] >= WIN_SCORE) this.victorySide = side;
+    if (reachedWinScore && this.mode !== 'online') this.victorySide = side;
   }
 
   private syncNodes(): void {
@@ -941,6 +988,9 @@ export class EditableMatch {
 
   private updateClocks(dt: number): void {
     if (this.matchEnded || this.goalCelebrationRemaining > 0) return;
+    if (this.mode === 'online') {
+      return;
+    }
     if (!this.penaltyShootout) this.matchRemaining = Math.max(0, this.matchRemaining - dt);
     const shouldTickTurn = this.penaltyShootout || this.isSettled();
     if (shouldTickTurn) this.turnRemaining = Math.max(0, this.turnRemaining - dt);
@@ -988,6 +1038,12 @@ export class EditableMatch {
     return name;
   }
 
+  private opponentDisplayName(): string {
+    if (this.mode === 'ai') return '电脑';
+    if (!this.onlineMatch) return '对手';
+    const opponent = this.onlineMatch.awayPlayer;
+    return opponent?.displayName || opponent?.username || '对手';
+  }
 
   private updateGoalCelebration(dt: number): void {
     if (this.goalCelebrationRemaining <= 0) return;
@@ -1000,6 +1056,10 @@ export class EditableMatch {
       this.enterPenaltyShootout();
       return;
     }
+    if (this.pendingOnlineFinishSide) {
+      this.startOnlineFinishAnimation();
+      return;
+    }
     if (this.victorySide) {
       this.matchEnded = true;
       this.turnRemaining = 0;
@@ -1007,6 +1067,11 @@ export class EditableMatch {
     }
     if (this.penaltyShootout) {
       this.advancePenaltyKick();
+      return;
+    }
+    if (this.mode === 'online' && this.resetOnlineObjectsFromInitialSnapshot(this.pendingKickoffTurn)) {
+      this.turnRemaining = TURN_SECONDS;
+      this.aiCooldown = 0.8;
       return;
     }
     this.resetObjects(this.pendingKickoffTurn);
@@ -1489,6 +1554,7 @@ export class EditableMatch {
   private ensureVictoryDetails(): void {
     const hud = this.ensureHudNode();
     if (this.mode === 'ai' && this.singleMatchServerReady && !this.singleMatchSettlement) return;
+    if (this.mode === 'online' && !this.singleMatchSettlement) return;
     if (findNode(hud, 'VictoryReturnButton')) return;
     const best = this.singleMatchSettlement?.bestPlayer || null;
     this.createHudLabel(hud, 'VictoryBestTitle', '本场最佳球员', 0, 108, 16, rgba(255, 246, 178), Label.HorizontalAlign.CENTER);
@@ -2092,12 +2158,54 @@ export class EditableMatch {
   }
 
   private matchLineup(side: TeamSide): Array<RosterPlayer | null> {
-    if (this.replayMode || (this.mode === 'ai' && this.singleMatchServerReady)) {
+    if (this.replayMode || this.usesServerLineup()) {
       return side === 'home' ? this.singleMatchHomeLineup : this.singleMatchAwayLineup;
     }
     return side === 'home' ? getLineupPlayers() : [];
   }
 
+  private usesServerLineup(): boolean {
+    return (this.mode === 'ai' && this.singleMatchServerReady) || (this.mode === 'online' && !!this.onlineMatch);
+  }
+
+  private applyOnlineMatchData(): void {
+    if (!this.onlineMatch) return;
+    this.activeMatchId = this.onlineMatch.matchId || MATCH_ID;
+    this.onlineInitialTurn = this.onlineMatch.initialTurn === 'away' ? 'away' : 'home';
+    this.singleMatchHomeFormationId = this.onlineMatch.homeFormationId || '';
+    this.singleMatchAwayFormationId = this.onlineMatch.awayFormationId || '';
+    this.singleMatchHomeLineup = normalizeLineup(this.onlineMatch.homeLineup);
+    this.singleMatchAwayLineup = normalizeLineup(this.onlineMatch.awayLineup);
+    this.onlineInitialSnapshot = this.onlineMatch.snapshot ? this.snapshotInLocalField(this.onlineMatch.snapshot) : null;
+  }
+
+  private onlineInitialLocalTurn(): TeamSide {
+    if (this.mode !== 'online') return 'home';
+    return this.onlineInitialTurn;
+  }
+
+  private resetOnlineObjectsFromInitialSnapshot(startingTurn: TeamSide): boolean {
+    if (!this.onlineInitialSnapshot) return false;
+    const template = this.onlineInitialSnapshot;
+    this.clearDragAim();
+    this.activeCurves.clear();
+    this.physicsAccumulator = 0;
+    this.ball = { ...template.ball, vx: 0, vy: 0 };
+    this.ballSpinDeg = 0;
+    this.players = (template.players || []).map((player) => ({ ...player, vx: 0, vy: 0 }));
+    this.turn = startingTurn;
+    this.resolveAllCollisions();
+    this.syncNodes();
+    return true;
+  }
+
+  private applyServerClock(matchRemaining: number, turnRemaining: number, turn: TeamSide, controlEnabled: boolean): void {
+    if (this.mode !== 'online') return;
+    this.matchRemaining = Math.max(0, matchRemaining);
+    this.turnRemaining = Math.max(0, turnRemaining);
+    if (!this.penaltyShootout && controlEnabled) this.turn = turn;
+    this.onlineControlEnabled = controlEnabled && turn === 'home' && this.isSettled() && this.goalCelebrationRemaining <= 0 && !this.matchEnded;
+  }
 
   private hideRuntimeMatchObjects(): void {
     for (let index = 1; index <= 5; index += 1) {
@@ -2111,7 +2219,7 @@ export class EditableMatch {
   }
 
   private flushSingleMatchSettlementValidation(): void {
-    if (this.mode !== 'ai' || !this.singleMatchServerReady || !this.singleMatchValidationPending || this.singleMatchValidationInFlight) return;
+    if (this.mode !== 'ai' || this.matchEnded || !this.singleMatchServerReady || !this.singleMatchValidationPending || this.singleMatchValidationInFlight) return;
     if (!this.isSettled()) return;
     this.singleMatchValidationInFlight = true;
     const snapshot = this.createSnapshot();
@@ -2165,9 +2273,35 @@ export class EditableMatch {
       .catch(() => undefined);
   }
 
-  private forceServerForfeit(message: string): void {
+  private flushOnlineMatchSettlement(): void {
+    if (this.mode !== 'online' || !this.matchEnded || !this.victorySide || this.singleMatchSettlement || this.onlineSettlementInFlight || !this.onlineMatch?.requestId) return;
+    const now = Date.now();
+    if (now < this.onlineSettlementNextRetryAt) return;
+    this.onlineSettlementInFlight = true;
+    void fetchOnlineSettlement(this.activeMatchId, this.onlineMatch.requestId)
+      .then((response) => {
+        if (response.ok && response.settlement) {
+          this.singleMatchSettlement = response.settlement;
+          this.clearVictoryRuntimeNodes();
+          return;
+        }
+        this.onlineSettlementNextRetryAt = Date.now() + 1000;
+      })
+      .catch(() => {
+        this.onlineSettlementNextRetryAt = Date.now() + 1000;
+      })
+      .then(() => {
+        this.onlineSettlementInFlight = false;
+      });
+  }
+
+  private forceServerForfeit(message: string, finalScore: ScoreState | null = null): void {
     void message;
     if (this.matchEnded) return;
+    if (this.mode === 'online') {
+      this.queueOnlineFinish('away', finalScore);
+      return;
+    }
     this.clearDragAim();
     this.goalCelebrationRemaining = 0;
     this.goalCelebrationElapsed = 0;
@@ -2175,13 +2309,293 @@ export class EditableMatch {
     this.matchEnded = true;
     this.turnRemaining = 0;
     if (this.score.away <= this.score.home) this.score.away = this.score.home + 1;
-    this.emitMatchEvent({ type: 'match-end', side: 'away' });
+    if (this.mode !== 'online') this.emitMatchEvent({ type: 'match-end', side: 'away' });
+  }
+
+  private forceServerVictory(message: string, finalScore: ScoreState | null = null): void {
+    void message;
+    if (this.matchEnded) return;
+    if (this.mode === 'online') {
+      this.queueOnlineFinish('home', finalScore);
+      return;
+    }
+    this.clearDragAim();
+    this.goalCelebrationRemaining = 0;
+    this.goalCelebrationElapsed = 0;
+    this.victorySide = 'home';
+    this.matchEnded = true;
+    this.turnRemaining = 0;
+    if (this.score.home <= this.score.away) this.score.home = this.score.away + 1;
+    if (this.mode !== 'online') this.emitMatchEvent({ type: 'match-end', side: 'home' });
+  }
+
+  private queueOnlineFinish(winner: TeamSide, finalScore: ScoreState | null): void {
+    this.pendingOnlineFinishSide = winner;
+    if (finalScore) this.pendingOnlineFinalScore = { ...finalScore };
+    this.onlineControlEnabled = false;
+    this.clearDragAim();
+    if (this.goalCelebrationRemaining > 0 || !this.isSettled()) return;
+    this.startOnlineFinishAnimation();
+  }
+
+  private startOnlineFinishAnimation(): void {
+    const winner = this.pendingOnlineFinishSide;
+    if (!winner || this.matchEnded) return;
+    if (this.pendingOnlineFinalScore) {
+      this.score = { ...this.pendingOnlineFinalScore };
+    } else if (winner === 'home' && this.score.home <= this.score.away) {
+      this.score.home = this.score.away + 1;
+    } else if (winner === 'away' && this.score.away <= this.score.home) {
+      this.score.away = this.score.home + 1;
+    }
+    this.pendingOnlineFinishSide = null;
+    this.pendingOnlineFinalScore = null;
+    this.victorySide = winner;
+    this.celebrationKind = 'matchEnd';
+    this.goalCelebrationRemaining = GOAL_CELEBRATION_SECONDS;
+    this.goalCelebrationElapsed = 0;
+    this.turnRemaining = 0;
+    this.clearDragAim();
+  }
+
+  private createFastSettlementPreview(): MatchSettlementPreview | null {
+    if (this.penaltyShootout) return null;
+    const players: PlayerDiskState[] = this.players.map((player) => ({ ...player }));
+    const ball: BallState = { ...this.ball };
+    const curves = new Map<string, CurveMotion>();
+    this.activeCurves.forEach((curve, id) => curves.set(id, { ...curve }));
+    const score = { ...this.score };
+    let tick = this.tickIndex;
+    const maxSteps = Math.round(18 / FIXED_PHYSICS_DT);
+    for (let step = 0; step < maxSteps; step += 1) {
+      const bodies: DiscBodyState[] = [...players, ball];
+      for (const body of bodies) this.integrateFastBody(body, FIXED_PHYSICS_DT, curves);
+      this.resolveFastCollisions(bodies, curves);
+      const goalSide = this.detectFastGoal(ball);
+      tick += 1;
+      if (goalSide) {
+        score[goalSide] += 1;
+        ball.vx = 0;
+        ball.vy = 0;
+        curves.delete(ball.id);
+        const actorId = this.lastShotActorId || `${goalSide}-1`;
+        return {
+          event: this.createMatchEventPayload({
+            type: 'goal',
+            side: goalSide,
+            actorId,
+            matchSecond: Math.round(MATCH_SECONDS - this.matchRemaining),
+            penalty: false,
+            ownGoal: !!this.lastShotActorId && !this.lastShotActorId.startsWith(goalSide),
+          }),
+        };
+      }
+      if (step > 12 && this.fastBodiesSettled(bodies)) break;
+    }
+    return {
+      snapshot: {
+        matchId: this.activeMatchId,
+        mode: this.mode,
+        fieldWidth: this.fieldWidth,
+        fieldHeight: this.fieldHeight,
+        tick,
+        turn: this.turn,
+        score,
+        players,
+        ball,
+      },
+    };
+  }
+
+  private integrateFastBody(body: DiscBodyState, dt: number, curves: Map<string, CurveMotion>): void {
+    const speedBeforeDamping = Math.sqrt(body.vx * body.vx + body.vy * body.vy);
+    this.applyFastCurveMotion(body, dt, speedBeforeDamping, curves);
+    body.x += body.vx * dt;
+    body.y += body.vy * dt;
+    const damping = Math.exp(-this.effectiveFriction(body, speedBeforeDamping) * dt);
+    body.vx *= damping;
+    body.vy *= damping;
+    const stopSpeed = body.kind === 'ball' ? BALL_STOP_SPEED : PLAYER_STOP_SPEED;
+    if (Math.sqrt(body.vx * body.vx + body.vy * body.vy) < stopSpeed) {
+      body.vx = 0;
+      body.vy = 0;
+      curves.delete(body.id);
+    }
+  }
+
+  private applyFastCurveMotion(body: DiscBodyState, dt: number, speed: number, curves: Map<string, CurveMotion>): void {
+    if (body.kind !== 'player' || speed <= 0) return;
+    const curve = curves.get(body.id);
+    if (!curve) return;
+    const travel = Math.min(speed * dt, curve.remainingDistance);
+    if (travel <= 0) {
+      curves.delete(body.id);
+      return;
+    }
+    const angleStep = curve.remainingAngle * (travel / curve.remainingDistance);
+    const cos = Math.cos(angleStep);
+    const sin = Math.sin(angleStep);
+    const vx = body.vx;
+    const vy = body.vy;
+    body.vx = vx * cos - vy * sin;
+    body.vy = vx * sin + vy * cos;
+    curve.remainingAngle -= angleStep;
+    curve.remainingDistance -= travel;
+    if (Math.abs(curve.remainingAngle) < 0.01 || curve.remainingDistance <= 1) curves.delete(body.id);
+  }
+
+  private resolveFastCollisions(bodies: DiscBodyState[], curves: Map<string, CurveMotion>): void {
+    for (let iteration = 0; iteration < SOLVER_ITERATIONS; iteration += 1) {
+      for (const body of bodies) this.collideFastArena(body, curves);
+      for (let i = 0; i < bodies.length; i += 1) {
+        for (let j = i + 1; j < bodies.length; j += 1) this.collideFastBodies(bodies[i], bodies[j], curves);
+      }
+    }
+  }
+
+  private collideFastArena(body: DiscBodyState, curves: Map<string, CurveMotion>): void {
+    const left = -this.fieldWidth / 2 + WALL_INSET + body.radius;
+    const right = this.fieldWidth / 2 - WALL_INSET - body.radius;
+    let collided = false;
+    if (body.x < left) {
+      body.x = left;
+      body.vx = Math.abs(body.vx) * this.wallRestitution(body);
+      collided = true;
+    }
+    if (body.x > right) {
+      body.x = right;
+      body.vx = -Math.abs(body.vx) * this.wallRestitution(body);
+      collided = true;
+    }
+    const topLimit = this.bodyInsideGoalMouth(body) ? this.fieldHeight / 2 - body.radius : this.goalLineY - body.radius;
+    const bottomLimit = this.bodyInsideGoalMouth(body) ? -this.fieldHeight / 2 + body.radius : -this.goalLineY + body.radius;
+    if (body.y > topLimit) {
+      body.y = topLimit;
+      body.vy = -Math.abs(body.vy) * this.wallRestitution(body);
+      collided = true;
+    }
+    if (body.y < bottomLimit) {
+      body.y = bottomLimit;
+      body.vy = Math.abs(body.vy) * this.wallRestitution(body);
+      collided = true;
+    }
+    if (this.collideFastCornerCushions(body)) collided = true;
+    if (collided) curves.delete(body.id);
+    if (body.kind === 'ball') {
+      const top = this.goalLineY;
+      const bottom = -this.goalLineY;
+      this.collideFastGoalPost(body, -GOAL_HALF_WIDTH, top);
+      this.collideFastGoalPost(body, GOAL_HALF_WIDTH, top);
+      this.collideFastGoalPost(body, -GOAL_HALF_WIDTH, bottom);
+      this.collideFastGoalPost(body, GOAL_HALF_WIDTH, bottom);
+    }
+  }
+
+  private collideFastGoalPost(body: DiscBodyState, x: number, y: number): void {
+    const postRadius = 5;
+    const dx = body.x - x;
+    const dy = body.y - y;
+    const min = body.radius + postRadius;
+    const dSq = dx * dx + dy * dy;
+    if (dSq >= min * min) return;
+    const d = Math.sqrt(dSq) || 0.0001;
+    const nx = dx / d;
+    const ny = dy / d;
+    body.x += nx * (min - d);
+    body.y += ny * (min - d);
+    const vn = body.vx * nx + body.vy * ny;
+    if (vn < 0) {
+      const bounce = 1 + this.wallRestitution(body);
+      body.vx -= bounce * vn * nx;
+      body.vy -= bounce * vn * ny;
+    }
+  }
+
+  private collideFastCornerCushions(body: DiscBodyState): boolean {
+    let collided = false;
+    const halfW = this.fieldWidth / 2;
+    const top = this.goalLineY;
+    const bottom = -this.goalLineY;
+    const corners = [
+      { x: -halfW, y: top, sx: -1, sy: 1 },
+      { x: halfW, y: top, sx: 1, sy: 1 },
+      { x: -halfW, y: bottom, sx: -1, sy: -1 },
+      { x: halfW, y: bottom, sx: 1, sy: -1 },
+    ];
+    for (const corner of corners) {
+      const dx = body.x - corner.x;
+      const dy = body.y - corner.y;
+      if (dx * corner.sx > 0 || dy * corner.sy > 0) continue;
+      const min = CORNER_CUSHION_RADIUS + body.radius;
+      const dSq = dx * dx + dy * dy;
+      if (dSq >= min * min) continue;
+      const d = Math.sqrt(dSq) || 0.0001;
+      const nx = dx / d;
+      const ny = dy / d;
+      body.x += nx * (min - d);
+      body.y += ny * (min - d);
+      const vn = body.vx * nx + body.vy * ny;
+      if (vn < 0) {
+        const bounce = 1 + CORNER_CUSHION_RESTITUTION;
+        body.vx -= bounce * vn * nx;
+        body.vy -= bounce * vn * ny;
+      }
+      collided = true;
+    }
+    return collided;
+  }
+
+  private collideFastBodies(a: DiscBodyState, b: DiscBodyState, curves: Map<string, CurveMotion>): void {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let d = Math.sqrt(dx * dx + dy * dy);
+    const min = a.radius + b.radius;
+    if (d >= min) return;
+    if (d < 0.0001) {
+      d = 0.0001;
+      dx = 1;
+      dy = 0;
+    }
+    const nx = dx / d;
+    const ny = dy / d;
+    const invA = 1 / a.mass;
+    const invB = 1 / b.mass;
+    const invTotal = invA + invB;
+    const correction = (min - d) / invTotal;
+    a.x -= nx * correction * invA;
+    a.y -= ny * correction * invA;
+    b.x += nx * correction * invB;
+    b.y += ny * correction * invB;
+    curves.delete(a.id);
+    curves.delete(b.id);
+    const relVx = b.vx - a.vx;
+    const relVy = b.vy - a.vy;
+    const relNormalSpeed = relVx * nx + relVy * ny;
+    if (relNormalSpeed > 0) return;
+    const restitution = this.collisionRestitution(a, b);
+    const impulse = (-(1 + restitution) * relNormalSpeed) / invTotal;
+    a.vx -= impulse * invA * nx;
+    a.vy -= impulse * invA * ny;
+    b.vx += impulse * invB * nx;
+    b.vy += impulse * invB * ny;
+  }
+
+  private detectFastGoal(ball: BallState): TeamSide | null {
+    if (Math.abs(ball.x) > GOAL_HALF_WIDTH - ball.radius) return null;
+    if (ball.y > this.goalLineY + ball.radius) return 'home';
+    if (ball.y < -this.goalLineY - ball.radius) return 'away';
+    return null;
+  }
+
+  private fastBodiesSettled(bodies: DiscBodyState[]): boolean {
+    return bodies.every((body) => Math.abs(body.vx) + Math.abs(body.vy) < 1);
   }
 
   dispose(): void {
     if (this.mode === 'ai' && !this.replayMode && this.singleMatchServerReady && !this.singleMatchFinishSent && this.activeMatchId !== MATCH_ID) {
       void abandonSingleMatch(this.activeMatchId).catch(() => undefined);
     }
+    this.transport.disconnect();
     this.clearDragAim();
     this.fieldGraphics = null;
     if (this.aimGraphics?.node?.isValid) this.aimGraphics.node.destroy();
@@ -2209,6 +2623,8 @@ export class EditableMatch {
     return {
       matchId: this.activeMatchId,
       mode: this.mode,
+      fieldWidth: this.fieldWidth,
+      fieldHeight: this.fieldHeight,
       tick: this.tickIndex,
       turn: this.turn,
       score: { ...this.score },
@@ -2218,24 +2634,58 @@ export class EditableMatch {
   }
 
   private applySnapshot(snapshot: MatchSnapshot): void {
-    if (snapshot.matchId !== this.activeMatchId && snapshot.matchId !== MATCH_ID) return;
-    this.tickIndex = Math.max(this.tickIndex, snapshot.tick);
-    this.turn = snapshot.turn;
-    this.score = { ...snapshot.score };
-    for (const incoming of snapshot.players) {
+    const localSnapshot = this.snapshotInLocalField(snapshot);
+    if (localSnapshot.matchId !== this.activeMatchId && localSnapshot.matchId !== MATCH_ID) return;
+    this.tickIndex = Math.max(this.tickIndex, localSnapshot.tick);
+    this.turn = localSnapshot.turn;
+    this.score = { ...localSnapshot.score };
+    for (const incoming of localSnapshot.players) {
       const current = this.players.find((p) => p.id === incoming.id);
       if (current) Object.assign(current, incoming);
       else this.players.push({ ...incoming });
     }
-    this.ball = { ...snapshot.ball };
+    this.ball = { ...localSnapshot.ball };
     this.activeCurves.clear();
     this.physicsAccumulator = 0;
     this.syncNodes();
   }
 
+  private snapshotInLocalField(snapshot: MatchSnapshot): MatchSnapshot {
+    const localWidth = this.fieldWidth;
+    const localHeight = this.fieldHeight;
+    const sourceWidth = snapshot.fieldWidth > 0 ? snapshot.fieldWidth : localWidth;
+    const sourceHeight = snapshot.fieldHeight > 0 ? snapshot.fieldHeight : localHeight;
+    const scaleX = localWidth / sourceWidth;
+    const scaleY = localHeight / sourceHeight;
+    const scaleBody = <T extends DiscBodyState>(body: T): T => ({
+      ...body,
+      x: body.x * scaleX,
+      y: body.y * scaleY,
+      vx: body.vx * scaleX,
+      vy: body.vy * scaleY,
+    }) as T;
+    return {
+      ...cloneSnapshot(snapshot),
+      fieldWidth: localWidth,
+      fieldHeight: localHeight,
+      players: (snapshot.players || []).map((player) => scaleBody(player)),
+      ball: scaleBody(snapshot.ball),
+    };
+  }
+
   private emitMatchEvent(event: Pick<MatchEvent, 'type' | 'side' | 'actorId' | 'matchSecond' | 'penalty' | 'ownGoal'>): void {
     if (this.replayMode) return;
-    const payload: MatchEvent = {
+    if (this.mode === 'online' && event.type === 'shoot') return;
+    if (this.mode === 'online' && event.type === 'match-end') return;
+    const payload = this.createMatchEventPayload(event);
+    void this.transport.submitMatchEvent(payload).catch(() => undefined);
+    if (this.mode === 'ai' && this.singleMatchServerReady) {
+      void sendSingleMatchEvent(this.activeMatchId, payload).catch(() => undefined);
+    }
+  }
+
+  private createMatchEventPayload(event: Pick<MatchEvent, 'type' | 'side' | 'actorId' | 'matchSecond' | 'penalty' | 'ownGoal'>): MatchEvent {
+    return {
       eventId: nextId(event.type),
       matchId: this.activeMatchId,
       tick: this.tickIndex,
@@ -2243,10 +2693,6 @@ export class EditableMatch {
       clientTick: Date.now(),
       ...event,
     };
-    void this.transport.submitMatchEvent(payload).catch(() => undefined);
-    if (this.mode === 'ai' && this.singleMatchServerReady) {
-      void sendSingleMatchEvent(this.activeMatchId, payload).catch(() => undefined);
-    }
   }
 
   private strokeLine(g: Graphics, x1: number, y1: number, x2: number, y2: number, c: Color, width: number): void {
@@ -2827,6 +3273,15 @@ function formatClock(seconds: number): string {
   const minutes = Math.floor(clamped / 60);
   const rest = clamped % 60;
   return `${minutes}:${rest < 10 ? '0' : ''}${rest}`;
+}
+
+function cloneSnapshot(snapshot: MatchSnapshot): MatchSnapshot {
+  return {
+    ...snapshot,
+    score: { ...snapshot.score },
+    players: (snapshot.players || []).map((player) => ({ ...player })),
+    ball: { ...snapshot.ball },
+  };
 }
 
 function easeOutCubic(t: number): number {

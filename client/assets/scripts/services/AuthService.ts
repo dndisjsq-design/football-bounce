@@ -37,6 +37,7 @@ const GUEST_USERNAME = 'visiter';
 const GUEST_DISPLAY_NAME = 'visiter';
 const GUEST_DEFAULT_COINS = 100000;
 const GUEST_SESSION_ID_KEY = 'footballBounce.guestSessionId';
+const CLIENT_INSTANCE_ID = `instance-${Date.now().toString(36)}-${randomHex(12)}`;
 const userSummaryListeners: Array<(summary: UserSummary) => void> = [];
 
 function resolveApiBaseUrl(): string {
@@ -59,7 +60,7 @@ export function authMessage(response: AuthResponse): string {
 
 export function loginWithPassword(username: string, password: string): Promise<AuthResponse> {
   const previousGuestSessionId = getCurrentGuestSessionId();
-  return postAuth('/auth/login', { username, password, deviceId: getOrCreateDeviceId() }).then((response) => {
+  return postAuth('/auth/login', { username, password, deviceId: getOrCreateDeviceId(), clientInstanceId: CLIENT_INSTANCE_ID }).then((response) => {
     if (response.code === 'SUCCESS' && previousGuestSessionId) resetGuestAccount(previousGuestSessionId);
     saveAuthSession(response);
     return response;
@@ -88,7 +89,7 @@ export function loginAsGuest(): void {
 export function tryAutoLogin(): Promise<AuthResponse | null> {
   const authToken = sys.localStorage.getItem(AUTH_TOKEN_KEY) || '';
   if (!authToken) return Promise.resolve(null);
-  return postAuth('/auth/auto-login', { deviceId: getOrCreateDeviceId(), authToken }).then((response) => {
+  return postAuth('/auth/auto-login', { deviceId: getOrCreateDeviceId(), authToken, clientInstanceId: CLIENT_INSTANCE_ID }).then((response) => {
     if (response.code === 'SUCCESS') {
       saveAuthSession(response);
       return response;
@@ -106,7 +107,7 @@ export function logoutCurrentDevice(): void {
   clearAuthSession();
   if (guest) resetGuestAccount(guestSessionId);
   if (!authToken) return;
-  void postAuth('/auth/logout', { deviceId, authToken }).catch(() => {
+  void postAuth('/auth/logout', { deviceId, authToken, clientInstanceId: CLIENT_INSTANCE_ID }).catch(() => {
     // Local logout should succeed even when the server is temporarily unreachable.
   });
 }
@@ -164,6 +165,18 @@ export function applyApiUserSummary(response: unknown): void {
 
 export function getCurrentGuestSessionId(): string {
   return sys.localStorage.getItem(GUEST_SESSION_ID_KEY) || '';
+}
+
+export function getCurrentDeviceId(): string {
+  return getOrCreateDeviceId();
+}
+
+export function getCurrentAuthToken(): string {
+  return sys.localStorage.getItem(AUTH_TOKEN_KEY) || '';
+}
+
+export function getCurrentClientInstanceId(): string {
+  return CLIENT_INSTANCE_ID;
 }
 
 export function isCurrentUserGuest(): boolean {

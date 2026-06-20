@@ -168,6 +168,7 @@ CREATE TABLE IF NOT EXISTS user_login_session (
   id BIGINT NOT NULL AUTO_INCREMENT,
   user_id BIGINT NOT NULL,
   device_id VARCHAR(128) NOT NULL,
+  client_instance_id VARCHAR(96) NULL,
   token_hash CHAR(64) NOT NULL,
   expires_at DATETIME(6) NOT NULL,
   last_used_at DATETIME(6) NOT NULL,
@@ -182,6 +183,19 @@ CREATE TABLE IF NOT EXISTS user_login_session (
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+SET @add_client_instance_id = (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE user_login_session ADD COLUMN client_instance_id VARCHAR(96) NULL AFTER device_id',
+    'SELECT 1'
+  )
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'user_login_session'
+    AND COLUMN_NAME = 'client_instance_id'
+);
+PREPARE stmt FROM @add_client_instance_id;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 CREATE TABLE IF NOT EXISTS player_data (
   player_id VARCHAR(64) NOT NULL,
@@ -329,6 +343,7 @@ CREATE TABLE IF NOT EXISTS user_match_record (
   updated_at DATETIME(6) NOT NULL,
   PRIMARY KEY (id),
   KEY idx_user_match_record_no (match_no),
+  KEY idx_user_match_record_match_time (match_time),
   KEY idx_user_match_record_user_time (user_id, match_time),
   KEY idx_user_match_record_session (user_id, client_session_id, match_time),
   KEY idx_user_match_record_type (match_type),
@@ -374,3 +389,17 @@ CREATE TABLE IF NOT EXISTS match_goal_record (
   KEY idx_match_goal_no_time (match_no, match_second),
   KEY idx_match_goal_user_player (user_id, player_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+SET @add_user_match_record_match_time_index = (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE user_match_record ADD INDEX idx_user_match_record_match_time (match_time)',
+    'SELECT 1'
+  )
+  FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'user_match_record'
+    AND INDEX_NAME = 'idx_user_match_record_match_time'
+);
+PREPARE stmt FROM @add_user_match_record_match_time_index;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;

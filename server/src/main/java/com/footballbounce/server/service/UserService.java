@@ -50,13 +50,14 @@ public class UserService {
         if (!passwordEncoder.matches(request.getPassword(), user.getPasswordHash())) {
             return AuthResponse.fail(AuthCode.WRONG_PASSWORD, "密码错误");
         }
-        return successWithOptionalSession(user, request.getDeviceId());
+        return successWithOptionalSession(user, request.getDeviceId(), request.getClientInstanceId());
     }
 
     @Transactional
     public AuthResponse autoLogin(AutoLoginRequest request) {
         String deviceId = normalizeTokenPart(request.getDeviceId());
         String authToken = normalizeTokenPart(request.getAuthToken());
+        String clientInstanceId = normalizeTokenPart(request.getClientInstanceId());
         if (deviceId.isEmpty() || authToken.isEmpty()) {
             return AuthResponse.fail(AuthCode.INVALID_SESSION, "自动登录已失效，请重新登录");
         }
@@ -68,7 +69,11 @@ public class UserService {
         if (user == null) {
             return AuthResponse.fail(AuthCode.INVALID_SESSION, "自动登录已失效，请重新登录");
         }
-        sessionMapper.touch(session.getId());
+        if (clientInstanceId.isEmpty()) {
+            sessionMapper.touch(session.getId());
+        } else {
+            sessionMapper.bindClientInstance(session.getId(), clientInstanceId);
+        }
         return AuthResponse.success("自动登录成功", UserDto.from(user));
     }
 
@@ -76,8 +81,9 @@ public class UserService {
     public AuthResponse logout(LogoutRequest request) {
         String deviceId = normalizeTokenPart(request.getDeviceId());
         String authToken = normalizeTokenPart(request.getAuthToken());
-        if (!deviceId.isEmpty() && !authToken.isEmpty()) {
-            sessionMapper.revoke(deviceId, sha256Hex(authToken));
+        String clientInstanceId = normalizeTokenPart(request.getClientInstanceId());
+        if (!deviceId.isEmpty() && !authToken.isEmpty() && !clientInstanceId.isEmpty()) {
+            sessionMapper.revoke(deviceId, sha256Hex(authToken), clientInstanceId);
         }
         return AuthResponse.success("已退出登录", null);
     }
@@ -102,14 +108,16 @@ public class UserService {
         return AuthResponse.success("注册成功", UserDto.from(user));
     }
 
-    private AuthResponse successWithOptionalSession(UserAccount user, String deviceIdValue) {
+    private AuthResponse successWithOptionalSession(UserAccount user, String deviceIdValue, String clientInstanceIdValue) {
         String deviceId = normalizeTokenPart(deviceIdValue);
         if (deviceId.isEmpty()) {
             return AuthResponse.success("登录成功", UserDto.from(user));
         }
+        String clientInstanceId = normalizeTokenPart(clientInstanceIdValue);
         String token = createToken();
         LocalDateTime expiresAt = LocalDateTime.now().plusDays(AUTO_LOGIN_DAYS);
-        sessionMapper.upsert(user.getId(), deviceId, sha256Hex(token), expiresAt);
+        sessionMapper.revokeOtherActiveSessions(user.getId(), deviceId);
+        sessionMapper.upsert(user.getId(), deviceId, clientInstanceId, sha256Hex(token), expiresAt);
         return AuthResponse.successWithToken("登录成功", UserDto.from(user), token, expiresAt.toString());
     }
 

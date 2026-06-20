@@ -41,17 +41,29 @@ export interface ShootCommand {
   power: number;
   curveAngleRad?: number;
   curveDistance?: number;
+  fieldWidth?: number;
+  fieldHeight?: number;
   clientTick: number;
 }
 
 export interface MatchSnapshot {
   matchId: string;
   mode: MatchMode;
+  fieldWidth: number;
+  fieldHeight: number;
   tick: number;
   turn: TeamSide;
   score: ScoreState;
   players: PlayerDiskState[];
   ball: BallState;
+}
+
+export interface MatchClockState {
+  serverTimeMillis: number;
+  matchRemainingSeconds: number;
+  turnRemainingSeconds: number;
+  turn: TeamSide;
+  controlEnabled?: boolean;
 }
 
 export type MatchEventType = 'shoot' | 'goal' | 'match-end';
