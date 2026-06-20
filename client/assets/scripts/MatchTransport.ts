@@ -125,7 +125,7 @@ export class OnlineMatchTransport implements MatchTransport {
       const response = await submitOnlineShoot(this.matchId, this.requestId, sizedCommand);
       if (!response.ok) {
         this.pendingResults.delete(command.commandId);
-        this.triggerForfeit(response.message || '服务端拒绝本次操作');
+        this.handleServerMatchEnd(response.message || '服务端拒绝本次操作', response.winnerNetworkSide || null, response.loserNetworkSide || null, response.finalScore || null);
         return;
       }
       if (settlement?.event) {
@@ -135,7 +135,6 @@ export class OnlineMatchTransport implements MatchTransport {
       }
     } catch {
       this.pendingResults.delete(command.commandId);
-      this.triggerForfeit('用户操作无法发送到后端');
     }
   }
 
@@ -151,7 +150,11 @@ export class OnlineMatchTransport implements MatchTransport {
       const response = await submitOnlineResult(this.matchId, this.requestId, resolvedCommandId, snapshot, null, this.currentFieldSize());
       this.applyClock(response.clock || null);
       if (!response.ok) {
-        this.handleServerMatchEnd(response.message || '服务端校验失败', response.winnerNetworkSide || null, response.loserNetworkSide || null, response.finalScore || null);
+        if (response.winnerNetworkSide || response.loserNetworkSide) {
+          this.handleServerMatchEnd(response.message || '服务端校验失败', response.winnerNetworkSide || null, response.loserNetworkSide || null, response.finalScore || null);
+        } else {
+          state.submitted = false;
+        }
         return;
       }
       if (!response.valid) {
@@ -182,7 +185,11 @@ export class OnlineMatchTransport implements MatchTransport {
       const response = await submitOnlineResult(this.matchId, this.requestId, resolvedCommandId, null, _event, this.currentFieldSize());
       this.applyClock(response.clock || null);
       if (!response.ok) {
-        this.handleServerMatchEnd(response.message || '服务端进球校验失败', response.winnerNetworkSide || null, response.loserNetworkSide || null, response.finalScore || null);
+        if (response.winnerNetworkSide || response.loserNetworkSide) {
+          this.handleServerMatchEnd(response.message || '服务端进球校验失败', response.winnerNetworkSide || null, response.loserNetworkSide || null, response.finalScore || null);
+        } else if (state) {
+          state.submitted = false;
+        }
         return;
       }
       if (!response.valid) {
@@ -250,12 +257,13 @@ export class OnlineMatchTransport implements MatchTransport {
     const response = await fetchOnlineActions(this.matchId, this.requestId, this.sinceSeq, this.currentFieldSize()).catch(() => null);
     if (!response) {
       this.pollFailureCount += 1;
-      if (this.pollFailureCount >= 40) this.triggerForfeit('联机连接中断');
       return;
     }
     this.pollFailureCount = 0;
     if (!response.ok) {
-      this.handleServerMatchEnd(response.message || '联机同步失败', response.winnerNetworkSide || null, response.loserNetworkSide || null, response.finalScore || null);
+      if (response.winnerNetworkSide || response.loserNetworkSide) {
+        this.handleServerMatchEnd(response.message || '联机同步失败', response.winnerNetworkSide || null, response.loserNetworkSide || null, response.finalScore || null);
+      }
       return;
     }
     let consumedSeq = this.sinceSeq;
@@ -287,12 +295,13 @@ export class OnlineMatchTransport implements MatchTransport {
     const response = await fetchOnlineClock(this.matchId, this.requestId, this.currentFieldSize()).catch(() => null);
     if (!response) {
       this.clockFailureCount += 1;
-      if (this.clockFailureCount >= 40) this.triggerForfeit('联机时钟连接中断');
       return;
     }
     this.clockFailureCount = 0;
     if (!response.ok) {
-      this.handleServerMatchEnd(response.message || '联机时钟同步失败', response.winnerNetworkSide || null, response.loserNetworkSide || null, response.finalScore || null);
+      if (response.winnerNetworkSide || response.loserNetworkSide) {
+        this.handleServerMatchEnd(response.message || '联机时钟同步失败', response.winnerNetworkSide || null, response.loserNetworkSide || null, response.finalScore || null);
+      }
       return;
     }
     this.applyClock(response.clock || null);
@@ -361,9 +370,7 @@ export class OnlineMatchTransport implements MatchTransport {
     }
     if (winnerNetworkSide === 'away' || loserNetworkSide === 'home') {
       this.triggerForfeit(message, finalScore);
-      return;
     }
-    this.triggerForfeit(message, finalScore);
   }
 }
 

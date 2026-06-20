@@ -360,6 +360,7 @@ CREATE TABLE IF NOT EXISTS match_action (
   actor_side VARCHAR(16) NOT NULL,
   actor_id VARCHAR(64) NULL,
   action_type VARCHAR(32) NOT NULL,
+  match_second INT NOT NULL DEFAULT 0,
   command_json TEXT NULL,
   valid_result TINYINT(1) NULL,
   validation_message VARCHAR(255) NULL,
@@ -369,6 +370,20 @@ CREATE TABLE IF NOT EXISTS match_action (
   KEY idx_match_action_no_type (match_no, action_type),
   KEY idx_match_action_actor_user (actor_user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+SET @add_match_action_second = (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE match_action ADD COLUMN match_second INT NOT NULL DEFAULT 0 AFTER action_type',
+    'SELECT 1'
+  )
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE()
+    AND TABLE_NAME = 'match_action'
+    AND COLUMN_NAME = 'match_second'
+);
+PREPARE stmt FROM @add_match_action_second;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 CREATE TABLE IF NOT EXISTS match_goal_record (
   id BIGINT NOT NULL AUTO_INCREMENT,

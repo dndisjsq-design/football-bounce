@@ -1,6 +1,7 @@
 import { ShootCommand } from '../MatchTypes';
 import { RosterPlayer } from './PlayerRosterService';
 import { getCurrentGuestSessionId, getCurrentUserId, postJson } from './AuthService';
+import type { MatchSettlement } from './SingleMatchService';
 
 export interface MatchRecordSummary {
   matchId: string;
@@ -26,6 +27,7 @@ export interface MatchActionRecord {
   actorSide: 'home' | 'away' | 'server';
   actorId: string;
   actionType: string;
+  matchSecond: number;
   commandJson: string;
   validResult?: boolean;
   validationMessage: string;
@@ -36,9 +38,16 @@ export interface MatchReplayData {
   ok: boolean;
   message: string;
   record?: MatchRecordSummary;
+  mirrored?: boolean;
   homeLineup: RosterPlayer[];
   awayLineup: RosterPlayer[];
   actions: MatchActionRecord[];
+}
+
+export interface MatchSettlementData {
+  ok: boolean;
+  message: string;
+  settlement?: MatchSettlement | null;
 }
 
 let selectedReplayMatchId = '';
@@ -53,6 +62,14 @@ export function fetchRecentMatchRecords(limit = 20): Promise<{ ok: boolean; mess
 
 export function fetchMatchReplay(matchId: string): Promise<MatchReplayData> {
   return postJson('/match-records/replay', {
+    matchId,
+    userId: getCurrentUserId(),
+    guestSessionId: getCurrentGuestSessionId(),
+  });
+}
+
+export function fetchMatchReplaySettlement(matchId: string): Promise<MatchSettlementData> {
+  return postJson('/match-records/settlement', {
     matchId,
     userId: getCurrentUserId(),
     guestSessionId: getCurrentGuestSessionId(),

@@ -6,6 +6,7 @@ import com.footballbounce.server.dto.match.MatchRecordDtos.RecentRequest;
 import com.footballbounce.server.dto.match.MatchRecordDtos.RecentResponse;
 import com.footballbounce.server.dto.match.MatchRecordDtos.ReplayRequest;
 import com.footballbounce.server.dto.match.MatchRecordDtos.ReplayResponse;
+import com.footballbounce.server.dto.match.MatchRecordDtos.SettlementResponse;
 import com.footballbounce.server.service.MatchRecordService;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -30,6 +31,11 @@ public class MatchRecordController {
     @PostMapping("/replay")
     public ReplayResponse replay(@RequestBody ReplayRequest request) {
         return matchRecordService.replay(request);
+    }
+
+    @PostMapping("/settlement")
+    public SettlementResponse settlement(@RequestBody ReplayRequest request) {
+        return matchRecordService.settlement(request);
     }
 
     @PostMapping("/guest-session/clear")

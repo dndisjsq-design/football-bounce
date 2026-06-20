@@ -46,6 +46,7 @@ import org.springframework.transaction.annotation.Transactional;
 public class SingleMatchService {
 
     private static final long GUEST_USER_ID = 1L;
+    private static final long MATCH_DURATION_MILLIS = 180_000L;
     private static final double DEFAULT_FIELD_WIDTH = 362;
     private static final double DEFAULT_FIELD_HEIGHT = 650;
     private static final double PLAYER_RADIUS = 20;
@@ -286,7 +287,7 @@ public class SingleMatchService {
         SettlementDto settlement = state.settlement(result, resultScore);
         mapper.finishMatch(state.matchNo, state.userId, duration, settlement.scoreText(), result);
         UserSummaryDto summary = recordMatchResult(state, result);
-        recordAction(state, "server", null, "finish", request, true, "match finished");
+        recordAction(state, "server", null, "end", request, true, "match finished");
         matches.remove(state.matchNo);
         return new FinishResponse(true, "比赛结果已保存", settlement, summary);
     }
@@ -364,6 +365,7 @@ public class SingleMatchService {
     ) {
         if (!shouldPersistReplayAction(actionType)) return;
         String safeSide = safeSide(actorSide);
+        int matchSecond = state.actionMatchSecond(command);
         mapper.insertAction(
                 state.matchNo,
                 state.nextActionIndex(),
@@ -371,6 +373,7 @@ public class SingleMatchService {
                 safeSide,
                 actorId,
                 actionType,
+                matchSecond,
                 toJson(command),
                 valid,
                 message
@@ -378,10 +381,12 @@ public class SingleMatchService {
     }
 
     private static boolean shouldPersistReplayAction(String actionType) {
-        return "shoot".equals(actionType)
+        return "start".equals(actionType)
+                || "shoot".equals(actionType)
                 || "ai-shoot".equals(actionType)
                 || "ai-penalty".equals(actionType)
-                || "ai-keeper".equals(actionType);
+                || "ai-keeper".equals(actionType)
+                || "end".equals(actionType);
     }
 
     private String toJson(Object value) {
@@ -428,6 +433,15 @@ public class SingleMatchService {
         } catch (NumberFormatException ex) {
             return 0;
         }
+    }
+
+    private static int rarityRank(String rarity) {
+        return switch (stringValue(rarity)) {
+            case "red" -> 0;
+            case "orange" -> 1;
+            case "purple" -> 2;
+            default -> 3;
+        };
     }
 
     private static double positiveOrDefault(Double value, double fallback) {
@@ -549,6 +563,7 @@ public class SingleMatchService {
         private final Map<String, PlayerSummary> lineupByPlayerId = new HashMap<>();
         private final double fieldWidth;
         private final double fieldHeight;
+        private final long startedAtMillis = System.currentTimeMillis();
         private final AtomicInteger actionIndex = new AtomicInteger();
         private final AtomicInteger goalOrder = new AtomicInteger();
         private final Set<String> recordedGoalEvents = ConcurrentHashMap.newKeySet();
@@ -588,6 +603,22 @@ public class SingleMatchService {
                 return 0L;
             }
             return 0L;
+        }
+
+        private int actionMatchSecond(Object command) {
+            if (command instanceof MatchEventRequest event) {
+                if (Boolean.TRUE.equals(event.penalty())) {
+                    return -1;
+                }
+                if (event.matchSecond() != null) {
+                    return Math.max(0, Math.min((int) (MATCH_DURATION_MILLIS / 1000), event.matchSecond()));
+                }
+            }
+            if (command instanceof FinishRequest finish && finish.durationSeconds() != null) {
+                return Math.max(0, Math.min((int) (MATCH_DURATION_MILLIS / 1000), finish.durationSeconds()));
+            }
+            long elapsed = System.currentTimeMillis() - startedAtMillis;
+            return (int) Math.max(0, Math.min(MATCH_DURATION_MILLIS, elapsed) / 1000);
         }
 
         private String usernameForSide(String side) {
@@ -684,7 +715,28 @@ public class SingleMatchService {
                     .sorted(Comparator.comparingInt(PlayerGoalCount::goals).reversed().thenComparingInt(PlayerGoalCount::firstOrder))
                     .map(PlayerGoalCount::toDto)
                     .findFirst()
-                    .orElse(null);
+                    .orElseGet(() -> fallbackBestPlayer(winnerSide));
+        }
+
+        private BestPlayerDto fallbackBestPlayer(String winnerSide) {
+            int bestSlot = -1;
+            PlayerSummary best = null;
+            for (int i = 0; i < lineupIds.size(); i += 1) {
+                PlayerSummary player = lineupByPlayerId.get(lineupIds.get(i));
+                if (player == null) {
+                    continue;
+                }
+                if (best == null || rarityRank(player.rarity()) < rarityRank(best.rarity())) {
+                    best = player;
+                    bestSlot = i;
+                }
+            }
+            if (best == null || bestSlot < 0) {
+                return null;
+            }
+            long fallbackUserId = "home".equals(winnerSide) ? userId : 0L;
+            String fallbackUsername = "home".equals(winnerSide) ? username : "人机";
+            return new BestPlayerDto(fallbackUserId, fallbackUsername, winnerSide, winnerSide + "-" + (bestSlot + 1), best.id(), best.name(), 0);
         }
 
         private void resetObjects(String startingTurn) {

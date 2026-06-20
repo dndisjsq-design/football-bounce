@@ -219,13 +219,17 @@ Architecture rule:
 Match history uses:
 
 - `user_match_record`: one row per user's perspective. For online matches, home and away users can each have a row for the same match number.
-- `match_action`: replay action data. Intended action types are start, end, and shoot-like replay actions. Current code should avoid storing non-replay noise.
+- `match_action`: replay action data with `match_second`. Intended action types are start, action or legacy shoot-like rows, and end.
 - `match_goal_record`: settlement and timeline goal data.
 
 Architecture rule:
 
 - Replay should be derived from canonical action data.
 - Away replay requests should be localized by the server before being sent to the client.
+- Away replay localization is a 180-degree transform: sides, player ids, command angle, score, and goal sides are converted before the client receives data.
+- The replay client runs display clocks locally and inserts actions by `match_second`; live match clock authority remains server-side for online matches.
+- Goal events are not stored in `match_action`; goals belong to `match_goal_record`.
+- Replay settlement is fetched separately after the replay reaches the end action.
 
 ## 8. Match Authority Model
 
@@ -239,11 +243,21 @@ Current online flow:
 4. Client sends command to server.
 5. Server converts command to canonical coordinates and simulates.
 6. Server publishes command to opponent.
-7. Both clients send snapshot or goal event back.
-8. Server scales/mirrors snapshots and compares against expected server result.
-9. Server confirms next turn or ends match on mismatch.
+7. Both clients send result acknowledgements back after local animation/calculation.
+8. Server ignores client snapshot/event content for winner and score authority.
+9. Server confirms next turn after both acknowledgements, or ends only by server score, server clock, or acknowledgement timeout.
 
-This gives responsive local feedback but still leaves business logic in the client.
+This keeps responsive local feedback while moving online winner, score, goal records, and match records to server authority.
+
+Current HTTP ordering:
+
+1. `/api/online-match/shoot` sends only the input action.
+2. Server validates and publishes the canonical action immediately.
+3. Server computes the authoritative result immediately from that action.
+4. Each client sends `/api/online-match/result` separately after local fast settlement or display settlement.
+5. Server treats those result calls as acknowledgements and confirms both results before allowing the next turn.
+
+Action submission and post-action snapshot are therefore separate HTTP requests, not one request.
 
 ### 8.2 Target Server-Authoritative Model
 

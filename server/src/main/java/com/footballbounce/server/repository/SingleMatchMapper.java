@@ -116,6 +116,7 @@ public interface SingleMatchMapper {
                 actor_side,
                 actor_id,
                 action_type,
+                match_second,
                 command_json,
                 valid_result,
                 validation_message,
@@ -127,6 +128,7 @@ public interface SingleMatchMapper {
                 #{actorSide},
                 #{actorId},
                 #{actionType},
+                #{matchSecond},
                 #{commandJson},
                 #{validResult},
                 #{validationMessage},
@@ -140,6 +142,7 @@ public interface SingleMatchMapper {
             @Param("actorSide") String actorSide,
             @Param("actorId") String actorId,
             @Param("actionType") String actionType,
+            @Param("matchSecond") int matchSecond,
             @Param("commandJson") String commandJson,
             @Param("validResult") Boolean validResult,
             @Param("validationMessage") String validationMessage

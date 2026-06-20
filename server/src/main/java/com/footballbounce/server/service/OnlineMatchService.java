@@ -198,7 +198,7 @@ public class OnlineMatchService {
             match.publishedActions.add(action);
             match.publishedByCommandId.put(command.commandId(), action);
             match.turnNetworkSide = match.opponentSide(action.actorNetworkSide);
-            mapper.insertAction(matchId, match.nextActionIndex(), userId, networkSide, serverCommand.actorId(), "online-shoot", commandJson(serverCommand), null, "pending");
+            mapper.insertAction(matchId, match.nextActionIndex(), userId, networkSide, serverCommand.actorId(), "action", match.matchSecond(now), commandJson(serverCommand), null, "pending");
             match.notifyAll();
             return new ActionResponse(true, "操作已登记并广播，等待双方结算确认", List.of(), match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
         }
@@ -230,22 +230,10 @@ public class OnlineMatchService {
                 action = match.publishedByCommandId.get(commandId);
             }
             if (action == null) return resultError("操作不存在或已过期");
-            if ("goal".equals(safeText(request.eventType()))) {
+            if (!action.expectedGoalSide().isBlank()) {
                 return handleGoalResult(request, userId, requestId, matchId, match, now, networkSide, action);
             }
-            SnapshotDto canonical = canonicalSnapshot(request.snapshot(), networkSide);
-            if (canonical == null) return resultError("结算快照为空");
-            String mismatch = compareSnapshots(action.expectedSnapshot, canonical);
-            boolean valid = mismatch.isEmpty();
-            if (valid) {
-                action.confirmedRequestIds.add(requestId);
-            }
-            if (!valid) {
-                match.finishWithLoser(networkSide, mismatch);
-                persistFinishedMatch(match, now);
-                match.notifyAll();
-                return new ResultResponse(false, false, false, mismatch, match.clock(now, networkSide), match.localWinnerSide(networkSide), match.localLoserSide(networkSide), match.localFinishScore(networkSide));
-            }
+            action.confirmedRequestIds.add(requestId);
             boolean confirmed = match.actionFullyConfirmed(action);
             if (confirmed) {
                 action.confirmed = true;
@@ -270,34 +258,13 @@ public class OnlineMatchService {
 
     private ResultResponse handleGoalResult(SubmitResultRequest request, long userId, String requestId, String matchId, OnlineRuntimeMatch match, long now, String networkSide, OnlineActionState action) {
         String expectedGoalSide = action.expectedGoalSide();
-        if (expectedGoalSide.isBlank()) {
-            String message = "服务端未计算出本次射门进球";
-            match.finishWithLoser(networkSide, message);
-            persistFinishedMatch(match, now);
-            match.notifyAll();
-            return new ResultResponse(false, false, false, message, match.clock(now, networkSide), match.localWinnerSide(networkSide), match.localLoserSide(networkSide), match.localFinishScore(networkSide));
-        }
-        String eventSide = canonicalSide(safeText(request.eventSide()), networkSide);
-        String eventActorId = canonicalActorId(safeText(request.eventActorId()), networkSide);
-        String message = "";
-        if (!expectedGoalSide.equals(eventSide)) {
-            message = "进球方向与服务端计算结果不一致";
-        } else if (!action.command.actorId().equals(eventActorId)) {
-            message = "进球球员与服务端记录的射门球员不一致";
-        }
-        if (!message.isBlank()) {
-            match.finishWithLoser(networkSide, message);
-            persistFinishedMatch(match, now);
-            match.notifyAll();
-            return new ResultResponse(false, false, false, message, match.clock(now, networkSide), match.localWinnerSide(networkSide), match.localLoserSide(networkSide), match.localFinishScore(networkSide));
-        }
         action.confirmedRequestIds.add(requestId);
         boolean confirmed = match.actionFullyConfirmed(action);
         boolean shouldPersistFinish = false;
         if (confirmed && !action.confirmed) {
             action.confirmed = true;
             match.pendingByCommandId.remove(request.commandId());
-            recordOnlineGoal(match, action, expectedGoalSide, now);
+            recordOnlineGoal(match, action, expectedGoalSide);
             match.turnNetworkSide = match.opponentSide(expectedGoalSide);
             match.serverState.turn = match.turnNetworkSide;
             match.serverState.resetObjects(match.turnNetworkSide);
@@ -321,12 +288,12 @@ public class OnlineMatchService {
         );
     }
 
-    private void recordOnlineGoal(OnlineRuntimeMatch match, OnlineActionState action, String goalSide, long now) {
+    private void recordOnlineGoal(OnlineRuntimeMatch match, OnlineActionState action, String goalSide) {
         if (match == null || action == null) return;
         String actorId = safeText(action.command.actorId());
         String actorSide = sideForActor(actorId, action.command.side());
         boolean ownGoal = !actorSide.equals(goalSide);
-        int matchSecond = (int) Math.max(0, Math.min(MATCH_DURATION_MILLIS, now - match.startedAtMillis) / 1000);
+        int matchSecond = match.matchSecond(action.createdAtMillis);
         long scorerUserId = match.userIdForSide(actorSide);
         String scorerUsername = match.usernameForSide(actorSide);
         String playerId = match.playerIdForActor(actorId);
@@ -443,7 +410,7 @@ public class OnlineMatchService {
                         .thenComparingInt(SettlementGoalDto::order))
                 .toList();
         String winnerSide = localWinnerSide(result, scoreText);
-        BestPlayerDto best = bestPlayer(winnerSide, goals);
+        BestPlayerDto best = bestPlayer(winnerSide, goals, record, userSide);
         SettlementDto settlement = new SettlementDto(matchId, result, scoreText, winnerSide, best, goals);
         return new SettlementResponse(true, "查询成功", settlement);
     }
@@ -481,7 +448,7 @@ public class OnlineMatchService {
     private void persistFinishedMatch(OnlineRuntimeMatch match, long now) {
         if (match == null || !match.finished || match.recordPersisted) return;
         match.recordPersisted = true;
-        ScoreDto score = adjustedFinishScore(match);
+        ScoreDto score = match.serverState.score();
         int duration = (int) Math.max(0, Math.min(MATCH_DURATION_MILLIS, now - match.startedAtMillis) / 1000);
         boolean homeWin = "home".equals(match.winnerNetworkSide);
         boolean awayWin = "away".equals(match.winnerNetworkSide);
@@ -489,23 +456,22 @@ public class OnlineMatchService {
         mapper.finishMatch(match.matchId, match.awayUserId, duration, score.away() + " : " + score.home(), awayWin ? "win" : "lose");
         matchRewardService.recordOnlineMatchResult(match.homeUserId, match.matchId, homeWin);
         matchRewardService.recordOnlineMatchResult(match.awayUserId, match.matchId, awayWin);
-    }
-
-    private static ScoreDto adjustedFinishScore(OnlineRuntimeMatch match) {
-        ScoreDto score = match.serverState.score();
-        int home = score.home();
-        int away = score.away();
-        if ("home".equals(match.winnerNetworkSide) && home <= away) {
-            home = away + 1;
-        } else if ("away".equals(match.winnerNetworkSide) && away <= home) {
-            away = home + 1;
-        }
-        return new ScoreDto(home, away);
+        mapper.insertAction(
+                match.matchId,
+                match.nextActionIndex(),
+                0L,
+                "server",
+                null,
+                "end",
+                duration,
+                finishJson(match.matchId, match.winnerNetworkSide, score),
+                true,
+                match.finishMessage == null || match.finishMessage.isBlank() ? "match finished" : match.finishMessage
+        );
     }
 
     private static ScoreDto finishScoreOrNull(OnlineRuntimeMatch match) {
-        if (match == null || !match.finished) return null;
-        return adjustedFinishScore(match);
+        return match == null || !match.finished ? null : match.serverState.score();
     }
 
     private static ScoreDto localScore(ScoreDto score, String targetNetworkSide) {
@@ -524,6 +490,7 @@ public class OnlineMatchService {
         String awayIds = String.join(",", away.playerIds());
         mapper.insertMatchRecord(matchId, home.userId(), home.username(), "home", home.clientSessionId(), "online", away.userId(), away.username(), home.formationId(), away.formationId(), homeIds, awayIds);
         mapper.insertMatchRecord(matchId, away.userId(), away.username(), "away", away.clientSessionId(), "online", home.userId(), home.username(), home.formationId(), away.formationId(), homeIds, awayIds);
+        mapper.insertAction(matchId, 0, 0L, "server", null, "start", 0, startJson(matchId), true, "match started");
     }
 
     private OnlineRuntimeMatch createRuntimeMatch(WaitingPlayer first, WaitingPlayer second, String matchId) {
@@ -739,7 +706,7 @@ public class OnlineMatchService {
         }
     }
 
-    private static BestPlayerDto bestPlayer(String winnerSide, List<SettlementGoalDto> goals) {
+    private BestPlayerDto bestPlayer(String winnerSide, List<SettlementGoalDto> goals, Map<String, Object> record, String userSide) {
         if (!"home".equals(winnerSide) && !"away".equals(winnerSide)) {
             return null;
         }
@@ -759,7 +726,59 @@ public class OnlineMatchService {
                         .thenComparingInt(SettlementPlayerGoalCount::firstOrder))
                 .map(SettlementPlayerGoalCount::toDto)
                 .findFirst()
-                .orElse(null);
+                .orElseGet(() -> fallbackBestPlayer(winnerSide, record, userSide));
+    }
+
+    private BestPlayerDto fallbackBestPlayer(String winnerSide, Map<String, Object> record, String userSide) {
+        String canonicalWinnerSide = canonicalSide(winnerSide, userSide);
+        String idsText = "away".equals(canonicalWinnerSide)
+                ? stringValue(record.get("awayLineupPlayerIds"))
+                : stringValue(record.get("homeLineupPlayerIds"));
+        List<PlayerSummary> lineup = loadLineupPlayers(splitIds(idsText));
+        if (lineup.isEmpty()) {
+            return null;
+        }
+        int bestSlot = 0;
+        PlayerSummary best = lineup.get(0);
+        for (int i = 1; i < lineup.size(); i += 1) {
+            PlayerSummary player = lineup.get(i);
+            int rank = rarityRank(player.rarity());
+            int bestRank = rarityRank(best.rarity());
+            if (rank < bestRank) {
+                best = player;
+                bestSlot = i;
+            }
+        }
+        long fallbackUserId = "home".equals(winnerSide)
+                ? longValue(record.get("userId"))
+                : longValue(record.get("opponentUserId"));
+        String fallbackUsername = "home".equals(winnerSide)
+                ? stringValue(record.get("username"))
+                : stringValue(record.get("opponentUsername"));
+        return new BestPlayerDto(fallbackUserId, fallbackUsername, winnerSide, winnerSide + "-" + (bestSlot + 1), best.id(), best.name(), 0);
+    }
+
+    private static List<String> splitIds(String idsText) {
+        if (idsText == null || idsText.isBlank()) {
+            return List.of();
+        }
+        List<String> ids = new ArrayList<>();
+        for (String part : idsText.split(",")) {
+            String id = part.trim();
+            if (!id.isBlank()) {
+                ids.add(id);
+            }
+        }
+        return ids;
+    }
+
+    private static int rarityRank(String rarity) {
+        return switch (safeTextStatic(rarity)) {
+            case "red" -> 0;
+            case "orange" -> 1;
+            case "purple" -> 2;
+            default -> 3;
+        };
     }
 
     private static FieldSize fieldSize(Double width, Double height) {
@@ -1059,6 +1078,20 @@ public class OnlineMatchService {
                 + "\"curveDistance\":" + (command.curveDistance() == null ? 0 : command.curveDistance()) + ","
                 + "\"clientTick\":" + command.clientTick()
                 + "}";
+    }
+
+    private static String finishJson(String matchId, String winnerSide, ScoreDto score) {
+        ScoreDto safeScore = score == null ? new ScoreDto(0, 0) : score;
+        return "{"
+                + "\"matchId\":\"" + jsonEscape(matchId) + "\","
+                + "\"type\":\"finish\","
+                + "\"side\":\"" + jsonEscape(winnerSide) + "\","
+                + "\"score\":{\"home\":" + safeScore.home() + ",\"away\":" + safeScore.away() + "}"
+                + "}";
+    }
+
+    private static String startJson(String matchId) {
+        return "{\"matchId\":\"" + jsonEscape(matchId) + "\",\"type\":\"start\"}";
     }
 
     private static String jsonEscape(String value) {
@@ -1756,6 +1789,10 @@ public class OnlineMatchService {
             double matchRemaining = Math.max(0, (MATCH_DURATION_MILLIS - (now - startedAtMillis)) / 1000.0);
             double turnRemaining = awaitingConfirmation() ? TURN_DURATION_MILLIS / 1000.0 : Math.max(0, (TURN_DURATION_MILLIS - (now - turnStartedAtMillis)) / 1000.0);
             return new OnlineClockDto(now, matchRemaining, turnRemaining, localSide(turnNetworkSide, targetNetworkSide), !awaitingConfirmation());
+        }
+
+        private int matchSecond(long now) {
+            return (int) Math.max(0, Math.min(MATCH_DURATION_MILLIS, now - startedAtMillis) / 1000);
         }
 
         private SnapshotDto localSnapshot(String targetNetworkSide) {

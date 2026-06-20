@@ -1,6 +1,7 @@
 package com.footballbounce.server.dto.match;
 
 import com.footballbounce.server.dto.match.SingleMatchDtos.PlayerSummary;
+import com.footballbounce.server.dto.match.SingleMatchDtos.SettlementDto;
 import java.util.List;
 
 public final class MatchRecordDtos {
@@ -42,6 +43,7 @@ public final class MatchRecordDtos {
             String actorSide,
             String actorId,
             String actionType,
+            int matchSecond,
             String commandJson,
             Boolean validResult,
             String validationMessage,
@@ -53,9 +55,17 @@ public final class MatchRecordDtos {
             boolean ok,
             String message,
             MatchRecordSummary record,
+            boolean mirrored,
             List<PlayerSummary> homeLineup,
             List<PlayerSummary> awayLineup,
             List<MatchActionDto> actions
+    ) {
+    }
+
+    public record SettlementResponse(
+            boolean ok,
+            String message,
+            SettlementDto settlement
     ) {
     }
 

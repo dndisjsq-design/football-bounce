@@ -85,15 +85,41 @@ public interface MatchRecordMapper {
                    actor_side AS actorSide,
                    actor_id AS actorId,
                    action_type AS actionType,
+                   GREATEST(
+                       match_second,
+                       COALESCE((
+                           SELECT TIMESTAMPDIFF(SECOND, MIN(r.match_time), match_action.created_at)
+                           FROM user_match_record r
+                           WHERE r.match_no = match_action.match_no
+                       ), 0)
+                   ) AS matchSecond,
                    command_json AS commandJson,
                    valid_result AS validResult,
                    validation_message AS validationMessage,
                    DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS createdAt
             FROM match_action
             WHERE match_no = #{matchNo}
+              AND action_type IN ('start', 'action', 'shoot', 'online-shoot', 'ai-shoot', 'ai-penalty', 'ai-keeper', 'end', 'finish')
             ORDER BY action_index ASC
             """)
     List<Map<String, Object>> findActions(@Param("matchNo") String matchNo);
+
+    @Select("""
+            SELECT match_second AS matchSecond,
+                   is_penalty AS penalty,
+                   user_id AS userId,
+                   username,
+                   side,
+                   actor_id AS actorId,
+                   player_id AS playerId,
+                   player_name AS playerName,
+                   is_own_goal AS ownGoal,
+                   goal_order AS goalOrder
+            FROM match_goal_record
+            WHERE match_no = #{matchNo}
+            ORDER BY match_second ASC, goal_order ASC
+            """)
+    List<Map<String, Object>> findGoalsByMatchNo(@Param("matchNo") String matchNo);
 
     @Select("""
             <script>

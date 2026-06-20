@@ -15,7 +15,7 @@ import {
   validateSingleMatchSnapshot,
   MatchSettlement,
 } from '../services/SingleMatchService';
-import { MatchActionRecord, MatchReplayData, fetchMatchReplay, parseShootCommand } from '../services/MatchRecordService';
+import { MatchActionRecord, MatchReplayData, fetchMatchReplay, fetchMatchReplaySettlement, parseShootCommand } from '../services/MatchRecordService';
 import type { OnlineMatchmakingResponse } from '../services/OnlineMatchService';
 import { fetchOnlineSettlement } from '../services/OnlineMatchService';
 import { findNode, rgba } from '../utils/CocosNodeUtils';
@@ -143,8 +143,11 @@ export class EditableMatch {
   private replayData: MatchReplayData | null = null;
   private replayActions: MatchActionRecord[] = [];
   private replayActionIndex = 0;
-  private replayDelay = 0.35;
+  private replayElapsedSeconds = 0;
+  private replayTurnStartedSecond = 0;
   private replayFinished = false;
+  private replayMirrorX = false;
+  private replaySettlementRequested = false;
   private onlineMatch: OnlineMatchmakingResponse | null = null;
   private onlineInitialTurn: TeamSide = 'home';
   private onlineControlEnabled = false;
@@ -262,13 +265,22 @@ export class EditableMatch {
       this.replayData = response;
       this.replayActions = response.actions.filter((action) => action.validResult !== false);
       this.replayActionIndex = 0;
-      this.replayDelay = 0.45;
+      this.replayElapsedSeconds = 0;
+      this.replayTurnStartedSecond = 0;
       this.replayFinished = false;
+      this.replayMirrorX = response.mirrored === true;
+      this.replaySettlementRequested = false;
       this.activeMatchId = response.record.matchId;
+      this.singleMatchSettlement = null;
       this.singleMatchHomeFormationId = response.record.homeFormationId;
       this.singleMatchAwayFormationId = response.record.awayFormationId || response.record.homeFormationId;
       this.singleMatchHomeLineup = normalizeLineup(response.homeLineup);
       this.singleMatchAwayLineup = normalizeLineup(response.awayLineup || response.homeLineup);
+      this.score = { home: 0, away: 0 };
+      this.matchRemaining = MATCH_SECONDS;
+      this.turnRemaining = TURN_SECONDS;
+      this.matchEnded = false;
+      this.victorySide = null;
       this.resetObjects(this.firstReplayTurn(response.actions));
       this.prepareMatchHud();
       this.setReplayHudLabels(response);
@@ -304,9 +316,12 @@ export class EditableMatch {
     const awayPoints = this.usesServerLineup() && this.singleMatchAwayFormationId
       ? getMatchFormationPointsById(this.singleMatchAwayFormationId, 'away', fw, fh)
       : getMatchFormationPoints('away', fw, fh);
+    const shouldMirrorReplayX = this.replayMode && this.replayMirrorX;
+    const displayHomePoints = shouldMirrorReplayX ? homePoints.map((point) => ({ ...point, x: -point.x })) : homePoints;
+    const displayAwayPoints = shouldMirrorReplayX ? awayPoints.map((point) => ({ ...point, x: -point.x })) : awayPoints;
     this.players = [
-      ...homePoints.map((point, index) => makePlayer(`home-${index + 1}`, 'home', point.x, point.y)),
-      ...awayPoints.map((point, index) => makePlayer(`away-${index + 1}`, 'away', point.x, point.y)),
+      ...displayHomePoints.map((point, index) => makePlayer(`home-${index + 1}`, 'home', point.x, point.y)),
+      ...displayAwayPoints.map((point, index) => makePlayer(`away-${index + 1}`, 'away', point.x, point.y)),
     ];
     this.resolveAllCollisions();
   }
@@ -324,61 +339,82 @@ export class EditableMatch {
   }
 
   private updateReplay(dt: number): void {
-    if (!this.replayMode || this.replayFinished || this.goalCelebrationRemaining > 0) return;
+    if (!this.replayMode || this.replayFinished || this.matchEnded) return;
+    this.advanceReplayClock(dt);
+    if (this.goalCelebrationRemaining > 0) return;
     if (!this.isSettled()) return;
-    if (this.replayDelay > 0) {
-      this.replayDelay = Math.max(0, this.replayDelay - dt);
-      return;
-    }
-    const action = this.nextReplayAction();
+    const action = this.peekNextReplayAction();
     if (!action) {
-      this.replayFinished = true;
-      const mode = findNode(this.ensureHudNode(), 'HudModeName')?.getComponent(Label);
-      if (mode) mode.string = '回放结束';
+      if (this.replayElapsedSeconds >= this.replayEndSecond()) this.finishReplay();
       return;
     }
+    if (this.replayElapsedSeconds + 0.001 < this.actionReplaySecond(action)) {
+      return;
+    }
+    this.replayActionIndex += 1;
     this.applyReplayAction(action);
   }
 
-  private nextReplayAction(): MatchActionRecord | null {
+  private advanceReplayClock(dt: number): void {
+    this.replayElapsedSeconds = Math.min(MATCH_SECONDS, this.replayElapsedSeconds + Math.max(0, dt));
+    this.matchRemaining = Math.max(0, MATCH_SECONDS - this.replayElapsedSeconds);
+    if (this.isSettled()) {
+      this.turnRemaining = Math.max(0, TURN_SECONDS - (this.replayElapsedSeconds - this.replayTurnStartedSecond));
+    }
+  }
+
+  private peekNextReplayAction(): MatchActionRecord | null {
     while (this.replayActionIndex < this.replayActions.length) {
       const action = this.replayActions[this.replayActionIndex];
-      this.replayActionIndex += 1;
-      if (action.actionType === 'shoot' || action.actionType === 'online-shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty' || action.actionType === 'event-goal' || action.actionType === 'kickoff-reset' || action.actionType === 'finish') {
+      if (this.isReplayAction(action)) {
         return action;
       }
+      this.replayActionIndex += 1;
     }
     return null;
   }
 
+  private isReplayAction(action: MatchActionRecord): boolean {
+    return action.actionType === 'shoot'
+      || action.actionType === 'action'
+      || action.actionType === 'online-shoot'
+      || action.actionType === 'ai-shoot'
+      || action.actionType === 'ai-penalty'
+      || action.actionType === 'end'
+      || action.actionType === 'finish';
+  }
+
+  private actionReplaySecond(action: MatchActionRecord): number {
+    const value = Number(action.matchSecond);
+    return Number.isFinite(value) ? clamp(value, 0, MATCH_SECONDS) : 0;
+  }
+
+  private replayEndSecond(): number {
+    const recordDuration = this.replayData?.record?.durationSeconds || 0;
+    if (recordDuration > 0) return Math.min(MATCH_SECONDS, recordDuration);
+    const last = this.replayActions.length > 0 ? this.replayActions[this.replayActions.length - 1] : null;
+    return last ? Math.min(MATCH_SECONDS, this.actionReplaySecond(last) + 2) : 0;
+  }
+
   private firstReplayTurn(actions: MatchActionRecord[]): TeamSide {
     const firstShoot = actions.find((action) => action.validResult !== false
-      && (action.actionType === 'shoot' || action.actionType === 'online-shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty')
+      && (action.actionType === 'shoot' || action.actionType === 'action' || action.actionType === 'online-shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty')
       && (action.actorSide === 'home' || action.actorSide === 'away'));
     return firstShoot?.actorSide === 'away' ? 'away' : 'home';
   }
 
   private applyReplayAction(action: MatchActionRecord): void {
-    if (action.actionType === 'shoot' || action.actionType === 'online-shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty') {
+    if (action.actionType === 'shoot' || action.actionType === 'action' || action.actionType === 'online-shoot' || action.actionType === 'ai-shoot' || action.actionType === 'ai-penalty') {
       const command = parseShootCommand(action);
       if (!command) return;
-      this.applyShoot({ ...command, matchId: this.activeMatchId });
-      this.replayDelay = 0.2;
+      this.turn = command.side;
+      if (this.applyShoot({ ...command, matchId: this.activeMatchId })) {
+        this.replayTurnStartedSecond = this.actionReplaySecond(action);
+      }
       return;
     }
-    if (action.actionType === 'event-goal') {
-      this.applyReplayGoal(action);
-      return;
-    }
-    if (action.actionType === 'kickoff-reset') {
-      this.resetObjects(action.actorSide === 'away' ? 'away' : 'home');
-      this.replayDelay = 0.25;
-      return;
-    }
-    if (action.actionType === 'finish') {
-      this.replayFinished = true;
-      const mode = findNode(this.ensureHudNode(), 'HudModeName')?.getComponent(Label);
-      if (mode) mode.string = '回放结束';
+    if (action.actionType === 'end' || action.actionType === 'finish') {
+      this.finishReplay();
     }
   }
 
@@ -401,7 +437,38 @@ export class EditableMatch {
     this.goalCelebrationRemaining = Math.min(1.4, GOAL_CELEBRATION_SECONDS);
     this.goalCelebrationElapsed = 0;
     this.celebrationKind = 'goal';
-    this.replayDelay = 0.35;
+    this.replayTurnStartedSecond = this.actionReplaySecond(action);
+  }
+
+  private finishReplay(): void {
+    if (this.matchEnded) return;
+    this.replayFinished = true;
+    const score = this.singleMatchSettlement?.scoreText ? parseReplayScoreText(this.singleMatchSettlement.scoreText) : this.score;
+    this.score = score;
+    const winner = this.singleMatchSettlement?.winnerSide || (score.home === score.away ? 'draw' : score.home > score.away ? 'home' : 'away');
+    this.victorySide = winner === 'away' ? 'away' : 'home';
+    this.matchEnded = true;
+    this.turnRemaining = 0;
+    this.clearVictoryRuntimeNodes();
+    const mode = findNode(this.ensureHudNode(), 'HudModeName')?.getComponent(Label);
+    if (mode) mode.string = '回放结束';
+    this.requestReplaySettlement();
+  }
+
+  private requestReplaySettlement(): void {
+    if (!this.replayMode || this.replaySettlementRequested || !this.activeMatchId) return;
+    this.replaySettlementRequested = true;
+    void fetchMatchReplaySettlement(this.activeMatchId)
+      .then((response) => {
+        if (response.ok && response.settlement) {
+          this.singleMatchSettlement = response.settlement;
+          this.score = parseReplayScoreText(response.settlement.scoreText);
+          const winner = response.settlement.winnerSide;
+          this.victorySide = winner === 'away' ? 'away' : 'home';
+          this.clearVictoryRuntimeNodes();
+        }
+      })
+      .catch(() => undefined);
   }
 
   private prepareMatchHud(): void {
@@ -960,11 +1027,11 @@ export class EditableMatch {
     this.pendingKickoffTurn = side === 'home' ? 'away' : 'home';
     this.goalCelebrationRemaining = GOAL_CELEBRATION_SECONDS;
     this.goalCelebrationElapsed = 0;
-    const reachedWinScore = this.score[side] >= WIN_SCORE;
-    this.celebrationKind = reachedWinScore && this.mode !== 'online' ? 'matchEnd' : 'goal';
+    const shouldEndByLocalScore = !this.replayMode && this.score[side] >= WIN_SCORE;
+    this.celebrationKind = shouldEndByLocalScore && this.mode !== 'online' ? 'matchEnd' : 'goal';
     this.clearDragAim();
     this.singleMatchValidationPending = false;
-    if (reachedWinScore && this.mode !== 'online') this.victorySide = side;
+    if (shouldEndByLocalScore && this.mode !== 'online') this.victorySide = side;
   }
 
   private syncNodes(): void {
@@ -3273,6 +3340,20 @@ function formatClock(seconds: number): string {
   const minutes = Math.floor(clamped / 60);
   const rest = clamped % 60;
   return `${minutes}:${rest < 10 ? '0' : ''}${rest}`;
+}
+
+function parseReplayScoreText(scoreText: string): ScoreState {
+  const parts = `${scoreText || ''}`.replace(/：/g, ':').split(':');
+  if (parts.length < 2) return { home: 0, away: 0 };
+  return {
+    home: leadingScoreNumber(parts[0]),
+    away: leadingScoreNumber(parts[1]),
+  };
+}
+
+function leadingScoreNumber(text: string): number {
+  const match = `${text || ''}`.match(/\d+/);
+  return match ? Number(match[0]) : 0;
 }
 
 function cloneSnapshot(snapshot: MatchSnapshot): MatchSnapshot {

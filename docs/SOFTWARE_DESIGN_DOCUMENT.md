@@ -670,7 +670,8 @@ Implementation:
 - Server normalizes command distance/speed from client field size to canonical field size.
 - Server simulates authoritative expected result.
 - Server publishes action for the opponent.
-- Server writes `match_action` with canonical replay command.
+- Server writes `match_action` with canonical replay command and `match_second`.
+- New online action rows use replay action type `action`.
 
 ### 9.5 POST `/api/online-match/actions`
 
@@ -830,15 +831,40 @@ Response:
 - match record summary
 - home lineup
 - away lineup
-- action list
+- action list, including `matchSecond`
 
 Implementation:
 
 - Reads `match_action`.
 - Online replay must account for home/away user side.
-- If viewer is away, server should mirror replay commands before sending.
+- If viewer is away, server mirrors the record, lineups, commands, scores, goal sides, and actor ids before sending.
+- Client replay advances its own total and turn clocks, and applies actions according to `matchSecond`.
+- Goal events are not returned from `match_action`; replay physics re-detects goals locally.
+- When replay reaches `end`, the client requests settlement data separately.
 
-### 10.3 POST `/api/match-records/guest-session/clear`
+### 10.3 POST `/api/match-records/settlement`
+
+Request:
+
+```json
+{
+  "matchId": "string",
+  "userId": 2,
+  "guestSessionId": "string"
+}
+```
+
+Response:
+
+- settlement data for the replay settlement page
+
+Implementation:
+
+- Reads the viewer-owned finished `user_match_record`.
+- Reads `match_goal_record` to build the settlement timeline.
+- Mirrors online away settlement into the viewer's local home perspective.
+
+### 10.4 POST `/api/match-records/guest-session/clear`
 
 Clears guest-session scoped records when product requires session cleanup.
 
@@ -913,7 +939,7 @@ Known risk:
 
 - The document is a baseline and must be updated whenever code changes.
 
-### 2026-06-20 - pending - away replay localization fix
+### 2026-06-20 - implemented - time-based replay and away settlement fix
 
 Scope: client/server
 
@@ -921,21 +947,33 @@ Changed:
 
 - Away replay records are now returned as local home perspective records.
 - Replay startup now sets the initial turn from the first replay shoot action instead of always forcing home.
-- This fixes the case where a canonical home action is mirrored into a local away action for an away viewer but the client starts replay with home turn and rejects the shot.
+- Replay actions now carry `matchSecond`.
+- Replay playback now uses match-relative timestamps instead of fixed sequential delays.
+- Replay response no longer includes settlement data.
+- Replay settlement now comes from `/api/match-records/settlement` after replay reaches `end`.
+- Away replay settlement mirrors goal sides and actor ids before sending.
+- Online match replay persistence now records only start, action, and end rows with match-relative seconds.
+- Single-match replay persistence now excludes goal and kickoff reset events from `match_action`; goals remain in `match_goal_record`.
+- Abnormal online finish no longer fabricates a higher winner score; persisted score uses the actual server score.
+- Online `/api/online-match/result` no longer allows client snapshot or goal-event mismatch to directly decide match winner; it is now an acknowledgement for the server-computed action result.
 
 API changes:
 
 - No endpoint path changes.
 - `/api/match-records/replay` now localizes `record.userSide` to `home` when an online away user views their replay.
+- `/api/match-records/replay` action items now include `matchSecond`.
+- New `/api/match-records/settlement` endpoint returns replay settlement data.
 
 Database changes:
 
-- None.
+- `match_action.match_second` was added.
 
 Verification:
 
-- Run server compile and tests after this change.
+- `mvn -q -DskipTests compile`
+- `mvn test`
 
 Known risk:
 
 - Existing old replay records still depend on command JSON quality in `match_action`.
+- Cocos Creator does not expose a standalone TypeScript build script in `client/package.json`, so client verification remains static plus runtime editor testing.
