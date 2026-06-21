@@ -4,6 +4,35 @@ CREATE DATABASE IF NOT EXISTS football_bounce
 
 USE football_bounce;
 
+CREATE TABLE IF NOT EXISTS api_message_log (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  trace_id VARCHAR(64) NOT NULL,
+  direction VARCHAR(32) NOT NULL,
+  logged_at DATETIME(6) NOT NULL,
+  method VARCHAR(12) NOT NULL,
+  path VARCHAR(255) NOT NULL,
+  query_string VARCHAR(1000) NULL,
+  status_code INT NULL,
+  duration_ms BIGINT NULL,
+  client_ip VARCHAR(64) NULL,
+  user_agent VARCHAR(512) NULL,
+  content_type VARCHAR(128) NULL,
+  user_id BIGINT NULL,
+  match_id VARCHAR(96) NULL,
+  request_id VARCHAR(128) NULL,
+  message_body MEDIUMTEXT NULL,
+  body_bytes INT NOT NULL DEFAULT 0,
+  is_truncated TINYINT(1) NOT NULL DEFAULT 0,
+  is_error TINYINT(1) NOT NULL DEFAULT 0,
+  created_at DATETIME(6) NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_api_message_log_trace (trace_id),
+  KEY idx_api_message_log_time (logged_at),
+  KEY idx_api_message_log_user_time (user_id, logged_at),
+  KEY idx_api_message_log_match_time (match_id, logged_at),
+  KEY idx_api_message_log_path_time (path, logged_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS guest_account_template (
   template_key VARCHAR(32) NOT NULL,
   username VARCHAR(64) NOT NULL,

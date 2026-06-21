@@ -9,6 +9,27 @@ import { findNode, onTap, rgba } from '../utils/CocosNodeUtils';
 
 const HEADER_COIN_X = 108;
 const HEADER_COIN_Y = 393;
+const MATCH_RECORD_PAGE_SIZE = 10;
+const MATCH_RECORD_ROW_HEIGHT = 94;
+const MATCH_RECORD_ROW_GAP = 12;
+const MATCH_RECORD_VIEWPORT_HEIGHT = 610;
+const MATCH_RECORD_VIEWPORT_WIDTH = 348;
+
+interface MatchRecordOverlayState {
+  overlay: Node;
+  viewport: Node;
+  statusLabel: Label | null;
+  records: MatchRecordSummary[];
+  rows: Node[];
+  offset: number;
+  startY: number;
+  startOffset: number;
+  loading: boolean;
+  hasMore: boolean;
+  rowHeight: number;
+  rowGap: number;
+  viewportHeight: number;
+}
 
 export function bindHomeScene(root: Node, selectMatchMode: (mode: MatchMode) => void): void {
   bindTabs(root, 'home');
@@ -381,22 +402,26 @@ function showMatchRecordOverlay(root: Node): void {
   viewport.layer = overlay.layer;
   overlay.addChild(viewport);
   viewport.setPosition(0, 0);
-  viewport.addComponent(UITransform).setContentSize(348, 610);
+  viewport.addComponent(UITransform).setContentSize(MATCH_RECORD_VIEWPORT_WIDTH, MATCH_RECORD_VIEWPORT_HEIGHT);
   const mask = viewport.addComponent(Mask);
   mask.type = MaskType.GRAPHICS_RECT;
-  void fetchRecentMatchRecords(20)
-    .then((response) => {
-      message.node.destroy();
-      if (!response.ok) {
-        createRuntimeLabel(overlay, 'MatchRecordError', response.message || '查询失败', 0, 230, 15, rgba(255, 204, 204), Label.HorizontalAlign.CENTER, 300, 28);
-        return;
-      }
-      renderMatchRecords(overlay, viewport, response.records || []);
-    })
-    .catch((error: Error) => {
-      message.node.destroy();
-      createRuntimeLabel(overlay, 'MatchRecordError', error.message || '无法连接后端', 0, 230, 15, rgba(255, 204, 204), Label.HorizontalAlign.CENTER, 300, 28);
-    });
+  const state: MatchRecordOverlayState = {
+    overlay,
+    viewport,
+    statusLabel: message,
+    records: [],
+    rows: [],
+    offset: 0,
+    startY: 0,
+    startOffset: 0,
+    loading: false,
+    hasMore: true,
+    rowHeight: MATCH_RECORD_ROW_HEIGHT,
+    rowGap: MATCH_RECORD_ROW_GAP,
+    viewportHeight: MATCH_RECORD_VIEWPORT_HEIGHT,
+  };
+  bindMatchRecordScroll(state);
+  loadNextMatchRecordPage(state);
 }
 
 function drawOverlayHeader(overlay: Node, width: number, height: number): void {
@@ -418,65 +443,117 @@ function drawOverlayHeader(overlay: Node, width: number, height: number): void {
   close.on(Node.EventType.TOUCH_END, () => overlay.destroy());
 }
 
-function renderMatchRecords(overlay: Node, viewport: Node, records: MatchRecordSummary[]): void {
-  if (records.length === 0) {
-    createRuntimeLabel(overlay, 'MatchRecordEmpty', '暂无已完成比赛记录', 0, 230, 16, rgba(226, 240, 255), Label.HorizontalAlign.CENTER, 260, 28);
-    return;
-  }
-  const rows: Node[] = [];
-  const rowH = 94;
-  const gap = 12;
-  const viewportHeight = viewport.getComponent(UITransform)?.contentSize.height || 610;
-  const contentHeight = records.length * rowH + Math.max(0, records.length - 1) * gap;
-  const scroll = { offset: 0, startY: 0, startOffset: 0 };
-  for (let i = 0; i < records.length; i += 1) {
-    const row = new Node(`MatchRecordRow_${i}`);
-    row.layer = viewport.layer;
-    viewport.addChild(row);
-    row.addComponent(UITransform).setContentSize(330, rowH);
-    row.addComponent(Graphics);
-    drawRecordRow(row, records[i]);
-    rows.push(row);
-  }
-  const render = () => {
-    const startY = viewportHeight / 2 - rowH / 2 - 4;
-    for (let i = 0; i < rows.length; i += 1) {
-      const y = startY - i * (rowH + gap) + scroll.offset;
-      rows[i].setPosition(0, y);
-      rows[i].active = y < viewportHeight / 2 + rowH && y > -viewportHeight / 2 - rowH;
+function bindMatchRecordScroll(state: MatchRecordOverlayState): void {
+  state.viewport.on(Node.EventType.TOUCH_START, (event: EventTouch) => {
+    state.startY = event.getUILocation().y;
+    state.startOffset = state.offset;
+  });
+  state.viewport.on(Node.EventType.TOUCH_MOVE, (event: EventTouch) => {
+    const max = matchRecordMaxScroll(state);
+    state.offset = clamp(state.startOffset + event.getUILocation().y - state.startY, 0, max);
+    renderMatchRecordRows(state);
+    if (state.hasMore && !state.loading && state.offset >= max - 1 && state.records.length >= MATCH_RECORD_PAGE_SIZE) {
+      loadNextMatchRecordPage(state);
     }
-  };
-  viewport.on(Node.EventType.TOUCH_START, (event: EventTouch) => {
-    scroll.startY = event.getUILocation().y;
-    scroll.startOffset = scroll.offset;
   });
-  viewport.on(Node.EventType.TOUCH_MOVE, (event: EventTouch) => {
-    scroll.offset = clamp(scroll.startOffset + event.getUILocation().y - scroll.startY, 0, Math.max(0, contentHeight - viewportHeight + 12));
-    render();
-  });
-  render();
 }
 
-function drawRecordRow(row: Node, record: MatchRecordSummary): void {
+function loadNextMatchRecordPage(state: MatchRecordOverlayState): void {
+  if (state.loading || !state.hasMore || !state.overlay.isValid) return;
+  state.loading = true;
+  setMatchRecordStatus(state, state.records.length === 0 ? '加载中...' : '加载更多...');
+  void fetchRecentMatchRecords(MATCH_RECORD_PAGE_SIZE, state.records.length)
+    .then((response) => {
+      if (!state.overlay.isValid) return;
+      state.loading = false;
+      if (!response.ok) {
+        setMatchRecordStatus(state, response.message || '查询失败', rgba(255, 204, 204));
+        return;
+      }
+      const nextRecords = response.records || [];
+      if (nextRecords.length < MATCH_RECORD_PAGE_SIZE) {
+        state.hasMore = false;
+      }
+      appendMatchRecordRows(state, nextRecords);
+      if (state.records.length === 0) {
+        setMatchRecordStatus(state, '暂无已完成比赛记录');
+      } else {
+        setMatchRecordStatus(state, state.hasMore ? '' : '没有更多记录');
+      }
+      renderMatchRecordRows(state);
+    })
+    .catch((error: Error) => {
+      if (!state.overlay.isValid) return;
+      state.loading = false;
+      setMatchRecordStatus(state, error.message || '无法连接后端', rgba(255, 204, 204));
+    });
+}
+
+function appendMatchRecordRows(state: MatchRecordOverlayState, records: MatchRecordSummary[]): void {
+  for (const record of records) {
+    const index = state.records.length;
+    state.records.push(record);
+    const row = new Node(`MatchRecordRow_${index}`);
+    row.layer = state.viewport.layer;
+    state.viewport.addChild(row);
+    row.addComponent(UITransform).setContentSize(330, state.rowHeight);
+    row.addComponent(Graphics);
+    drawRecordRow(row, record, state.overlay);
+    state.rows.push(row);
+  }
+}
+
+function renderMatchRecordRows(state: MatchRecordOverlayState): void {
+  const startY = state.viewportHeight / 2 - state.rowHeight / 2 - 4;
+  const max = matchRecordMaxScroll(state);
+  state.offset = clamp(state.offset, 0, max);
+  for (let i = 0; i < state.rows.length; i += 1) {
+    const y = startY - i * (state.rowHeight + state.rowGap) + state.offset;
+    state.rows[i].setPosition(0, y);
+  }
+}
+
+function matchRecordMaxScroll(state: MatchRecordOverlayState): number {
+  if (state.records.length === 0) return 0;
+  const contentHeight = state.records.length * state.rowHeight + Math.max(0, state.records.length - 1) * state.rowGap;
+  return Math.max(0, contentHeight - state.viewportHeight + 8);
+}
+
+function setMatchRecordStatus(state: MatchRecordOverlayState, text: string, color = rgba(226, 240, 255)): void {
+  if (!text) {
+    if (state.statusLabel?.node.isValid) state.statusLabel.node.active = false;
+    return;
+  }
+  if (!state.statusLabel || !state.statusLabel.node.isValid) {
+    state.statusLabel = createRuntimeLabel(state.overlay, 'MatchRecordStatus', text, 0, -318, 14, color, Label.HorizontalAlign.CENTER, 280, 24);
+  }
+  state.statusLabel.node.setPosition(0, state.records.length === 0 ? 250 : -318);
+  state.statusLabel.node.active = true;
+  state.statusLabel.string = text;
+  state.statusLabel.color = color;
+}
+
+function drawRecordRow(row: Node, record: MatchRecordSummary, overlay: Node): void {
   const g = row.getComponent(Graphics) || row.addComponent(Graphics);
   g.clear();
-  g.fillColor = rgba(20, 58, 116, 245);
+  g.fillColor = rgba(226, 239, 255, 250);
   g.roundRect(-165, -47, 330, 94, 6);
   g.fill();
-  g.strokeColor = rgba(140, 198, 255, 180);
-  g.lineWidth = 1.5;
+  g.strokeColor = rgba(82, 119, 164, 190);
+  g.lineWidth = 1.4;
   g.roundRect(-165, -47, 330, 94, 6);
   g.stroke();
-  drawRecordAvatar(g, -126, 16, 18, rgba(238, 77, 77));
-  drawRecordAvatar(g, 126, 16, 18, rgba(74, 135, 232));
-  createRuntimeLabel(row, 'SelfName', displayGuestName(record.username), -92, 19, 13, rgba(255, 255, 255), Label.HorizontalAlign.LEFT, 82, 20);
-  createRuntimeLabel(row, 'OpponentName', record.opponentUsername || '人机', 38, 19, 13, rgba(255, 255, 255), Label.HorizontalAlign.LEFT, 82, 20);
-  createRuntimeLabel(row, 'Score', record.resultScore || '- : -', 0, 16, 24, resultColor(record.result), Label.HorizontalAlign.CENTER, 120, 32).isBold = true;
-  createRuntimeLabel(row, 'Time', `${record.matchTime}  ${record.matchType === 'single' ? '单人' : '联机'}`, -150, -21, 11, rgba(188, 213, 244), Label.HorizontalAlign.LEFT, 210, 18);
+  drawRecordAvatar(g, -136, 16, 18, rgba(238, 77, 77));
+  drawRecordAvatar(g, 139, 16, 18, rgba(74, 135, 232));
+  createRuntimeLabel(row, 'SelfName', displayGuestName(record.username), -80, 19, 13, rgba(30, 48, 72), Label.HorizontalAlign.CENTER, 78, 20).isBold = true;
+  createRuntimeLabel(row, 'OpponentName', record.opponentUsername || '人机', 78, 19, 13, rgba(30, 48, 72), Label.HorizontalAlign.CENTER, 76, 20).isBold = true;
+  createRuntimeLabel(row, 'Score', record.resultScore || '- : -', 0, 16, 22, resultColor(record.result), Label.HorizontalAlign.CENTER, 64, 30).isBold = true;
+  createRuntimeLabel(row, 'Time', formatRecordDateTime(record.matchTime), -72, -21, 11, rgba(66, 88, 116), Label.HorizontalAlign.CENTER, 164, 18);
+  createRuntimeLabel(row, 'Mode', record.matchType === 'single' ? '单人' : '联机', 39, -21, 12, rgba(66, 88, 116), Label.HorizontalAlign.CENTER, 50, 18).isBold = true;
   const replay = new Node('ReplayButton');
   replay.layer = row.layer;
   row.addChild(replay);
-  replay.setPosition(108, -24);
+  replay.setPosition(121, -24);
   replay.addComponent(UITransform).setContentSize(72, 28);
   const replayG = replay.addComponent(Graphics);
   replayG.fillColor = rgba(255, 204, 64, 255);
@@ -485,8 +562,16 @@ function drawRecordRow(row: Node, record: MatchRecordSummary): void {
   createRuntimeLabel(replay, 'ReplayLabel', '回放', 0, 0, 13, rgba(35, 38, 48), Label.HorizontalAlign.CENTER, 60, 20).isBold = true;
   replay.on(Node.EventType.TOUCH_END, () => {
     setSelectedReplayMatchId(record.matchId);
+    overlay.destroy();
     director.loadScene('Match');
   });
+}
+
+function formatRecordDateTime(value: string): string {
+  const normalized = `${value || ''}`.replace('T', ' ').trim();
+  const match = normalized.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})/);
+  if (!match) return normalized || '-';
+  return `${match[1]} ${match[2]}`;
 }
 
 function drawRecordAvatar(g: Graphics, x: number, y: number, radius: number, color: Color): void {
@@ -507,9 +592,9 @@ function drawRecordAvatar(g: Graphics, x: number, y: number, radius: number, col
 }
 
 function resultColor(result: string): Color {
-  if (result === 'win') return rgba(255, 236, 156);
-  if (result === 'lose') return rgba(176, 213, 255);
-  return rgba(255, 255, 255);
+  if (result === 'win') return rgba(174, 63, 44);
+  if (result === 'lose') return rgba(43, 86, 154);
+  return rgba(38, 54, 76);
 }
 
 function displayGuestName(name: string): string {

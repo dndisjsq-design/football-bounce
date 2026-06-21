@@ -52,11 +52,12 @@ export interface MatchSettlementData {
 
 let selectedReplayMatchId = '';
 
-export function fetchRecentMatchRecords(limit = 20): Promise<{ ok: boolean; message: string; records: MatchRecordSummary[] }> {
+export function fetchRecentMatchRecords(limit = 20, offset = 0): Promise<{ ok: boolean; message: string; records: MatchRecordSummary[] }> {
   return postJson('/match-records/recent', {
     userId: getCurrentUserId(),
     guestSessionId: getCurrentGuestSessionId(),
     limit,
+    offset,
   });
 }
 

@@ -35,14 +35,15 @@ public interface MatchRecordMapper {
                 AND client_session_id = #{guestSessionId}
               </if>
             ORDER BY match_time DESC
-            LIMIT #{limit}
+            LIMIT #{offset}, #{limit}
             </script>
             """)
     List<Map<String, Object>> findRecentRecords(
             @Param("userId") long userId,
             @Param("guestOnly") boolean guestOnly,
             @Param("guestSessionId") String guestSessionId,
-            @Param("limit") int limit
+            @Param("limit") int limit,
+            @Param("offset") int offset
     );
 
     @Select("""

@@ -9,7 +9,7 @@ public final class MatchRecordDtos {
     private MatchRecordDtos() {
     }
 
-    public record RecentRequest(Long userId, String guestSessionId, Integer limit) {
+    public record RecentRequest(Long userId, String guestSessionId, Integer limit, Integer offset) {
     }
 
     public record MatchRecordSummary(

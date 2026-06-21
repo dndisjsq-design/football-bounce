@@ -45,7 +45,8 @@ public class MatchRecordService {
             return new RecentResponse(true, "游客本次登录没有比赛记录", List.of());
         }
         int limit = Math.max(1, Math.min(50, request == null || request.limit() == null ? 20 : request.limit()));
-        List<MatchRecordSummary> records = mapper.findRecentRecords(userId, guestOnly, guestSessionId, limit)
+        int offset = Math.max(0, request == null || request.offset() == null ? 0 : request.offset());
+        List<MatchRecordSummary> records = mapper.findRecentRecords(userId, guestOnly, guestSessionId, limit, offset)
                 .stream()
                 .map(MatchRecordService::recordSummary)
                 .toList();
