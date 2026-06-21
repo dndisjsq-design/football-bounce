@@ -128,7 +128,10 @@ public interface MatchRecordMapper {
                    name,
                    score,
                    rarity,
-                   avatar_seed AS avatarSeed
+                   avatar_seed AS avatarSeed,
+                   power,
+                   accuracy,
+                   curve
             FROM player_data
             WHERE player_id IN
               <foreach collection="ids" item="id" open="(" separator="," close=")">

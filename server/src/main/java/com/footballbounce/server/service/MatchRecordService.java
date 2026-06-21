@@ -12,6 +12,7 @@ import com.footballbounce.server.dto.match.MatchRecordDtos.ReplayRequest;
 import com.footballbounce.server.dto.match.MatchRecordDtos.ReplayResponse;
 import com.footballbounce.server.dto.match.MatchRecordDtos.SettlementResponse;
 import com.footballbounce.server.dto.match.SingleMatchDtos.BestPlayerDto;
+import com.footballbounce.server.dto.match.SingleMatchDtos.PlayerPhysicsSummary;
 import com.footballbounce.server.dto.match.SingleMatchDtos.PlayerSummary;
 import com.footballbounce.server.dto.match.SingleMatchDtos.SettlementDto;
 import com.footballbounce.server.dto.match.SingleMatchDtos.SettlementGoalDto;
@@ -28,6 +29,11 @@ import org.springframework.transaction.annotation.Transactional;
 public class MatchRecordService {
 
     private static final long GUEST_USER_ID = 1L;
+    private static final int DEFAULT_ABILITY_SCORE = 100;
+    private static final double ABILITY_FULL_SCORE = 100.0;
+    private static final double CURVE_DEGREES_TO_RADIANS = Math.PI / 180.0;
+    private static final double MAX_DRAG_FORCE_DISTANCE = 149;
+    private static final double MAX_CURVE_ANGLE_AT_FULL_SCORE = 50 * CURVE_DEGREES_TO_RADIANS;
 
     private final MatchRecordMapper mapper;
     private final ObjectMapper objectMapper;
@@ -354,7 +360,8 @@ public class MatchRecordService {
                     stringValue(row.get("name")),
                     intValue(row.get("score")),
                     stringValue(row.get("rarity")),
-                    intValue(row.get("avatarSeed"))
+                    intValue(row.get("avatarSeed")),
+                    physicsFromRow(row)
             );
             byId.put(player.id(), player);
         }
@@ -438,6 +445,43 @@ public class MatchRecordService {
         } catch (NumberFormatException ex) {
             return 0;
         }
+    }
+
+    private static int abilityScore(Object value) {
+        if (value == null) {
+            return DEFAULT_ABILITY_SCORE;
+        }
+        int score;
+        if (value instanceof Number number) {
+            score = number.intValue();
+        } else {
+            String text = String.valueOf(value).trim();
+            if (text.isEmpty()) {
+                return DEFAULT_ABILITY_SCORE;
+            }
+            try {
+                score = Integer.parseInt(text);
+            } catch (NumberFormatException ex) {
+                return DEFAULT_ABILITY_SCORE;
+            }
+        }
+        return Math.max(0, score);
+    }
+
+    private static double abilityMultiplier(Object value) {
+        int score = abilityScore(value);
+        if (score <= ABILITY_FULL_SCORE) {
+            return score / ABILITY_FULL_SCORE;
+        }
+        double extra = score - ABILITY_FULL_SCORE;
+        return 1 + 0.035 * extra + 0.006 * extra * extra;
+    }
+
+    private static PlayerPhysicsSummary physicsFromRow(Map<String, Object> row) {
+        double power = abilityMultiplier(row.get("power"));
+        double accuracy = abilityMultiplier(row.get("accuracy"));
+        double curve = abilityMultiplier(row.get("curve"));
+        return new PlayerPhysicsSummary("", MAX_DRAG_FORCE_DISTANCE * power, power, accuracy, MAX_CURVE_ANGLE_AT_FULL_SCORE * curve);
     }
 
     private static long longValue(Object value) {

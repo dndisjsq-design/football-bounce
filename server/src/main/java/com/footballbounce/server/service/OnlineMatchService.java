@@ -19,6 +19,7 @@ import com.footballbounce.server.dto.match.OnlineMatchDtos.SubmitResultRequest;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.SubmitShootRequest;
 import com.footballbounce.server.dto.match.SingleMatchDtos.BestPlayerDto;
 import com.footballbounce.server.dto.match.SingleMatchDtos.BodyDto;
+import com.footballbounce.server.dto.match.SingleMatchDtos.PlayerPhysicsSummary;
 import com.footballbounce.server.dto.match.SingleMatchDtos.PlayerSummary;
 import com.footballbounce.server.dto.match.SingleMatchDtos.ScoreDto;
 import com.footballbounce.server.dto.match.SingleMatchDtos.SettlementDto;
@@ -49,13 +50,19 @@ public class OnlineMatchService {
     private static final long MATCH_DURATION_MILLIS = 180_000L;
     private static final long TURN_DURATION_MILLIS = 15_000L;
     private static final long RESULT_CONFIRM_TIMEOUT_MILLIS = 20_000L;
+    private static final long RESULT_RESPONSE_WAIT_MILLIS = 18_000L;
     private static final long ACTION_LONG_POLL_MILLIS = 3_500L;
     private static final int WIN_SCORE = 3;
     private static final double DEFAULT_FIELD_WIDTH = 362;
     private static final double DEFAULT_FIELD_HEIGHT = 650;
     private static final double PLAYER_RADIUS = 20;
     private static final double BALL_RADIUS = 13;
-    private static final double PLAYER_SHOT_SPEED = 890;
+    private static final double PLAYER_SHOT_SPEED = 989;
+    private static final double ABILITY_FULL_SCORE = 100.0;
+    private static final int DEFAULT_ABILITY_SCORE = 100;
+    private static final double CURVE_DEGREES_TO_RADIANS = Math.PI / 180.0;
+    private static final double MAX_DRAG_FORCE_DISTANCE = 149;
+    private static final double MAX_CURVE_ANGLE_AT_FULL_SCORE = 50 * CURVE_DEGREES_TO_RADIANS;
     private static final double PLAYER_MASS = 3.2;
     private static final double BALL_MASS = 0.75;
     private static final double PLAYER_FRICTION = 1.65;
@@ -71,7 +78,6 @@ public class OnlineMatchService {
     private static final double GOAL_HALF_WIDTH = 63;
     private static final double GOAL_DEPTH = 30;
     private static final int SOLVER_ITERATIONS = 5;
-    private static final double MAX_CURVE_ANGLE = 0.92;
     private static final double CURVE_MIN_DISTANCE = 34;
     private static final double CORNER_CUSHION_RADIUS = 36;
     private static final double CORNER_CUSHION_RESTITUTION = 0.92;
@@ -161,7 +167,7 @@ public class OnlineMatchService {
                 safeText(request.actorId()),
                 safeText(request.side()).isBlank() ? "home" : safeText(request.side()),
                 request.angleRad() == null ? 0 : request.angleRad(),
-                request.power() == null ? 0 : clamp(request.power(), 0, 1),
+                Math.max(0, request.power() == null ? 0 : request.power()),
                 request.curveAngleRad(),
                 request.curveDistance(),
                 request.clientTick() == null ? System.currentTimeMillis() : request.clientTick()
@@ -235,13 +241,20 @@ public class OnlineMatchService {
             }
             action.confirmedRequestIds.add(requestId);
             boolean confirmed = match.actionFullyConfirmed(action);
-            if (confirmed) {
+            if (confirmed && !action.confirmed) {
                 action.confirmed = true;
                 match.pendingByCommandId.remove(commandId);
                 match.turnStartedAtMillis = now;
-            }
-            if (confirmed) {
                 match.notifyAll();
+            }
+            if (!confirmed) {
+                waitForResultConfirmation(match, action, now + RESULT_RESPONSE_WAIT_MILLIS);
+                now = System.currentTimeMillis();
+                if (match.finished) {
+                    persistFinishedMatch(match, now);
+                    return match.finishedResultResponse(now, networkSide);
+                }
+                confirmed = action.confirmed;
             }
             return new ResultResponse(
                     true,
@@ -251,7 +264,9 @@ public class OnlineMatchService {
                     match.clock(now, networkSide),
                     null,
                     null,
-                    null
+                    null,
+                    confirmed ? match.localPhysics("home", networkSide) : List.of(),
+                    confirmed ? match.localPhysics("away", networkSide) : List.of()
             );
         }
     }
@@ -274,8 +289,14 @@ public class OnlineMatchService {
                 shouldPersistFinish = true;
             }
         }
-        if (shouldPersistFinish) persistFinishedMatch(match, now);
         if (confirmed) match.notifyAll();
+        if (!confirmed) {
+            waitForResultConfirmation(match, action, now + RESULT_RESPONSE_WAIT_MILLIS);
+            now = System.currentTimeMillis();
+            confirmed = action.confirmed;
+            shouldPersistFinish = match.finished;
+        }
+        if (shouldPersistFinish) persistFinishedMatch(match, now);
         return new ResultResponse(
                 true,
                 true,
@@ -284,8 +305,23 @@ public class OnlineMatchService {
                 match.clock(now, networkSide),
                 match.localWinnerSide(networkSide),
                 match.localLoserSide(networkSide),
-                match.localFinishScore(networkSide)
+                match.localFinishScore(networkSide),
+                confirmed && !match.finished ? match.localPhysics("home", networkSide) : List.of(),
+                confirmed && !match.finished ? match.localPhysics("away", networkSide) : List.of()
         );
+    }
+
+    private void waitForResultConfirmation(OnlineRuntimeMatch match, OnlineActionState action, long deadlineMillis) {
+        while (!match.finished && !action.confirmed) {
+            long remaining = deadlineMillis - System.currentTimeMillis();
+            if (remaining <= 0) return;
+            try {
+                match.wait(remaining);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
     }
 
     private void recordOnlineGoal(OnlineRuntimeMatch match, OnlineActionState action, String goalSide) {
@@ -367,7 +403,8 @@ public class OnlineMatchService {
                 persistFinishedMatch(match, now);
                 return new ClockResponse(false, match.finishMessage, match.clock(now, networkSide), match.localWinnerSide(networkSide), match.localLoserSide(networkSide), match.localFinishScore(networkSide));
             }
-            return new ClockResponse(true, "ok", match.clock(now, networkSide), null, null, null);
+            OnlineClockDto clock = match.clock(now, networkSide);
+            return new ClockResponse(true, "ok", clock, null, null, null);
         }
     }
 
@@ -646,7 +683,7 @@ public class OnlineMatchService {
     }
 
     private ResultResponse resultError(String message) {
-        return new ResultResponse(false, false, false, message, null, null, null, null);
+        return new ResultResponse(false, false, false, message, null, null, null, null, List.of(), List.of());
     }
 
     private SettlementResponse settlementError(String message) {
@@ -875,7 +912,7 @@ public class OnlineMatchService {
         double localAngle = normalizeAngle(command.angleRad());
         double canonicalAngle = angleBetweenFields(localAngle, sourceFieldSize, canonicalFieldSize(), "away".equals(networkSide));
         double distanceScale = distanceScaleForAngle(localAngle, sourceFieldSize, canonicalFieldSize());
-        double canonicalPower = clamp(command.power(), 0, 1) * distanceScale;
+        double canonicalPower = Math.max(0, command.power()) * distanceScale;
         Double canonicalCurveDistance = command.curveDistance() == null ? null : Math.max(0, command.curveDistance()) * distanceScale;
         if (!"away".equals(networkSide)) {
             return new OnlineShootCommandDto(
@@ -1167,7 +1204,8 @@ public class OnlineMatchService {
                     stringValue(row.get("name")),
                     intValue(row.get("score")),
                     stringValue(row.get("rarity")),
-                    intValue(row.get("avatarSeed"))
+                    intValue(row.get("avatarSeed")),
+                    physicsFromRow(row)
             );
             byId.put(player.id(), player);
         }
@@ -1221,6 +1259,68 @@ public class OnlineMatchService {
         } catch (Exception ignored) {
             return 0;
         }
+    }
+
+    private static int abilityScore(Object value) {
+        if (value == null) {
+            return DEFAULT_ABILITY_SCORE;
+        }
+        int score;
+        if (value instanceof Number number) {
+            score = number.intValue();
+        } else {
+            String text = String.valueOf(value).trim();
+            if (text.isEmpty()) {
+                return DEFAULT_ABILITY_SCORE;
+            }
+            try {
+                score = Integer.parseInt(text);
+            } catch (NumberFormatException ignored) {
+                return DEFAULT_ABILITY_SCORE;
+            }
+        }
+        return Math.max(0, score);
+    }
+
+    private static double abilityMultiplier(Object value) {
+        int score = abilityScore(value);
+        if (score <= ABILITY_FULL_SCORE) {
+            return score / ABILITY_FULL_SCORE;
+        }
+        double extra = score - ABILITY_FULL_SCORE;
+        return 1 + 0.035 * extra + 0.006 * extra * extra;
+    }
+
+    private static PlayerPhysicsSummary physicsFromRow(Map<String, Object> row) {
+        return physicsWithActorId(
+                "",
+                abilityMultiplier(row.get("power")),
+                abilityMultiplier(row.get("accuracy")),
+                abilityMultiplier(row.get("curve"))
+        );
+    }
+
+    private static PlayerPhysicsSummary physicsWithActorId(String actorId, PlayerPhysicsSummary physics) {
+        if (physics == null) {
+            return physicsWithActorId(actorId, 1, 1, 1);
+        }
+        return new PlayerPhysicsSummary(
+                actorId,
+                physics.maxDragForceDistance(),
+                physics.shotPowerScale(),
+                physics.accuracyLineScale(),
+                physics.maxCurveAngleRad()
+        );
+    }
+
+    private static PlayerPhysicsSummary physicsWithActorId(String actorId, double powerMultiplier, double accuracyMultiplier, double curveMultiplier) {
+        return new PlayerPhysicsSummary(
+                actorId,
+                MAX_DRAG_FORCE_DISTANCE * powerMultiplier,
+                powerMultiplier,
+                accuracyMultiplier,
+                MAX_CURVE_ANGLE_AT_FULL_SCORE * curveMultiplier
+        );
     }
 
     private static long longValue(Object value) {
@@ -1301,6 +1401,8 @@ public class OnlineMatchService {
         private final String matchId;
         private final String homeFormationId;
         private final String awayFormationId;
+        private final List<PlayerSummary> homeLineup;
+        private final List<PlayerSummary> awayLineup;
         private final double fieldWidth;
         private final double fieldHeight;
         private final List<Body> players = new ArrayList<>();
@@ -1312,10 +1414,12 @@ public class OnlineMatchService {
         private long tick = 0;
         private boolean goalLocked = false;
 
-        private OnlineServerState(String matchId, String homeFormationId, String awayFormationId, double fieldWidth, double fieldHeight) {
+        private OnlineServerState(String matchId, String homeFormationId, String awayFormationId, List<PlayerSummary> homeLineup, List<PlayerSummary> awayLineup, double fieldWidth, double fieldHeight) {
             this.matchId = matchId == null ? "" : matchId;
             this.homeFormationId = homeFormationId;
             this.awayFormationId = awayFormationId;
+            this.homeLineup = homeLineup == null ? List.of() : List.copyOf(homeLineup);
+            this.awayLineup = awayLineup == null ? List.of() : List.copyOf(awayLineup);
             this.fieldWidth = fieldWidth;
             this.fieldHeight = fieldHeight;
         }
@@ -1334,7 +1438,7 @@ public class OnlineMatchService {
             }
             for (int i = 0; i < 5; i += 1) {
                 PointRatio point = awayFormation.get(Math.min(i, awayFormation.size() - 1));
-                players.add(makePlayer("away-" + (i + 1), "away", point.x * fieldWidth, point.y * fieldHeight * -1));
+                players.add(makePlayer("away-" + (i + 1), "away", -point.x * fieldWidth, point.y * fieldHeight * -1));
             }
             resolveAllCollisions();
         }
@@ -1347,16 +1451,34 @@ public class OnlineMatchService {
             return snapshot();
         }
 
+        private PlayerSummary playerForActor(String actorId) {
+            int slot = slotIndex(actorId);
+            if (slot < 0) return null;
+            List<PlayerSummary> lineup = actorId != null && actorId.startsWith("away-") ? awayLineup : homeLineup;
+            return slot >= lineup.size() ? null : lineup.get(slot);
+        }
+
+        private double powerScaleForActor(String actorId) {
+            PlayerSummary player = playerForActor(actorId);
+            return player == null || player.physics() == null ? 1 : player.physics().shotPowerScale();
+        }
+
+        private double maxCurveAngleForActor(String actorId) {
+            PlayerSummary player = playerForActor(actorId);
+            return player == null || player.physics() == null ? MAX_CURVE_ANGLE_AT_FULL_SCORE : player.physics().maxCurveAngleRad();
+        }
+
         private boolean applyCommand(OnlineShootCommandDto command) {
             Body actor = findBody(command.actorId());
             if (actor == null || !actor.side.equals(command.side()) || !command.side().equals(turn) || !isSettled()) {
                 return false;
             }
-            double curveAngle = clamp(command.curveAngleRad() == null ? 0 : command.curveAngleRad(), -MAX_CURVE_ANGLE, MAX_CURVE_ANGLE);
+            double maxCurveAngle = maxCurveAngleForActor(actor.id);
+            double curveAngle = clamp(command.curveAngleRad() == null ? 0 : command.curveAngleRad(), -maxCurveAngle, maxCurveAngle);
             double curveDistance = Math.max(0, command.curveDistance() == null ? 0 : command.curveDistance());
             boolean hasCurve = Math.abs(curveAngle) > 0.03 && curveDistance > CURVE_MIN_DISTANCE;
             double shotAngle = command.angleRad() + (hasCurve ? curveAngle : 0);
-            double speed = PLAYER_SHOT_SPEED * Math.max(0, command.power());
+            double speed = PLAYER_SHOT_SPEED * clamp(command.power(), 0, powerScaleForActor(actor.id));
             actor.vx = Math.cos(shotAngle) * speed;
             actor.vy = Math.sin(shotAngle) * speed;
             activeCurves.clear();
@@ -1736,7 +1858,7 @@ public class OnlineMatchService {
             this.awayLineup = awayLineup == null ? List.of() : List.copyOf(awayLineup);
             this.startedAtMillis = startedAtMillis;
             this.turnStartedAtMillis = startedAtMillis;
-            this.serverState = new OnlineServerState(matchId, this.homeFormationId, this.awayFormationId, DEFAULT_FIELD_WIDTH, DEFAULT_FIELD_HEIGHT);
+            this.serverState = new OnlineServerState(matchId, this.homeFormationId, this.awayFormationId, this.homeLineup, this.awayLineup, DEFAULT_FIELD_WIDTH, DEFAULT_FIELD_HEIGHT);
             this.serverState.resetObjects("home");
             this.fieldSizesByRequestId.put(homeRequestId, canonicalFieldSize());
             this.fieldSizesByRequestId.put(awayRequestId, canonicalFieldSize());
@@ -1840,6 +1962,20 @@ public class OnlineMatchService {
             return lineup.get(slot).id();
         }
 
+        private List<PlayerPhysicsSummary> localPhysics(String localSide, String targetNetworkSide) {
+            boolean targetIsAway = "away".equals(targetNetworkSide);
+            boolean localHome = !"away".equals(localSide);
+            List<PlayerSummary> lineup = targetIsAway
+                    ? (localHome ? awayLineup : homeLineup)
+                    : (localHome ? homeLineup : awayLineup);
+            String actorSide = localHome ? "home" : "away";
+            List<PlayerPhysicsSummary> result = new ArrayList<>();
+            for (int i = 0; i < lineup.size(); i += 1) {
+                result.add(physicsWithActorId(actorSide + "-" + (i + 1), lineup.get(i).physics()));
+            }
+            return result;
+        }
+
         private String playerNameForId(String side, String playerId) {
             List<PlayerSummary> lineup = "away".equals(side) ? awayLineup : homeLineup;
             for (PlayerSummary player : lineup) {
@@ -1893,7 +2029,7 @@ public class OnlineMatchService {
         }
 
         private ResultResponse finishedResultResponse(long now, String targetNetworkSide) {
-            return new ResultResponse(false, false, false, finishMessage, clock(now, targetNetworkSide), localWinnerSide(targetNetworkSide), localLoserSide(targetNetworkSide), localFinishScore(targetNetworkSide));
+            return new ResultResponse(false, false, false, finishMessage, clock(now, targetNetworkSide), localWinnerSide(targetNetworkSide), localLoserSide(targetNetworkSide), localFinishScore(targetNetworkSide), List.of(), List.of());
         }
 
     }

@@ -1,6 +1,7 @@
 import { MatchClockState, MatchEvent, MatchMode, MatchSnapshot, ScoreState, ShootCommand, TeamSide } from './MatchTypes';
 import type { MatchFieldSize, OnlineAction, OnlineClock, OnlineMatchmakingResponse } from './services/OnlineMatchService';
 import { fetchOnlineActions, fetchOnlineClock, submitOnlineResult, submitOnlineShoot } from './services/OnlineMatchService';
+import type { PlayerPhysicsProfile } from './services/PlayerRosterService';
 
 interface PendingResultState {
   submitted: boolean;
@@ -20,6 +21,7 @@ export interface MatchTransport {
   onRemoteShoot(handler: (command: ShootCommand) => boolean | MatchSettlementPreview): void;
   onSnapshot(handler: (snapshot: MatchSnapshot) => void): void;
   onClock(handler: (clock: MatchClockState) => void): void;
+  onPlayerPhysics(handler: (homePhysics: PlayerPhysicsProfile[], awayPhysics: PlayerPhysicsProfile[]) => void): void;
   onServerForfeit(handler: (message: string, finalScore?: ScoreState | null) => void): void;
   onServerVictory(handler: (message: string, finalScore?: ScoreState | null) => void): void;
   setFieldSizeProvider(provider: (() => MatchFieldSize) | null): void;
@@ -59,6 +61,10 @@ export class LocalMatchTransport implements MatchTransport {
     return;
   }
 
+  onPlayerPhysics(_handler: (homePhysics: PlayerPhysicsProfile[], awayPhysics: PlayerPhysicsProfile[]) => void): void {
+    return;
+  }
+
   onServerForfeit(_handler: (message: string, finalScore?: ScoreState | null) => void): void {
     return;
   }
@@ -89,6 +95,7 @@ export class OnlineMatchTransport implements MatchTransport {
   private shootHandler: ((command: ShootCommand) => boolean | MatchSettlementPreview) | null = null;
   private snapshotHandler: ((snapshot: MatchSnapshot) => void) | null = null;
   private clockHandler: ((clock: MatchClockState) => void) | null = null;
+  private playerPhysicsHandler: ((homePhysics: PlayerPhysicsProfile[], awayPhysics: PlayerPhysicsProfile[]) => void) | null = null;
   private forfeitHandler: ((message: string, finalScore?: ScoreState | null) => void) | null = null;
   private victoryHandler: ((message: string, finalScore?: ScoreState | null) => void) | null = null;
   private matchId = '';
@@ -148,6 +155,7 @@ export class OnlineMatchTransport implements MatchTransport {
     state.submitted = true;
     try {
       const response = await submitOnlineResult(this.matchId, this.requestId, resolvedCommandId, snapshot, null, this.currentFieldSize());
+      this.applyPlayerPhysics(response.homePhysics, response.awayPhysics);
       this.applyClock(response.clock || null);
       if (!response.ok) {
         if (response.winnerNetworkSide || response.loserNetworkSide) {
@@ -162,7 +170,8 @@ export class OnlineMatchTransport implements MatchTransport {
         return;
       }
       if (!response.confirmed) {
-        this.pendingResults.delete(resolvedCommandId);
+        state.submitted = false;
+        setTimeout(() => void this.submitSnapshot(snapshot, resolvedCommandId), 500);
         return;
       }
       this.pendingResults.delete(resolvedCommandId);
@@ -183,6 +192,7 @@ export class OnlineMatchTransport implements MatchTransport {
     if (state) state.submitted = true;
     try {
       const response = await submitOnlineResult(this.matchId, this.requestId, resolvedCommandId, null, _event, this.currentFieldSize());
+      this.applyPlayerPhysics(response.homePhysics, response.awayPhysics);
       this.applyClock(response.clock || null);
       if (!response.ok) {
         if (response.winnerNetworkSide || response.loserNetworkSide) {
@@ -194,6 +204,13 @@ export class OnlineMatchTransport implements MatchTransport {
       }
       if (!response.valid) {
         if (state) state.submitted = false;
+        return;
+      }
+      if (!response.confirmed) {
+        if (state) {
+          state.submitted = false;
+          setTimeout(() => void this.submitMatchEvent(_event, resolvedCommandId), 500);
+        }
         return;
       }
       if (state) this.pendingResults.delete(resolvedCommandId);
@@ -215,6 +232,10 @@ export class OnlineMatchTransport implements MatchTransport {
 
   onClock(handler: (clock: MatchClockState) => void): void {
     this.clockHandler = handler;
+  }
+
+  onPlayerPhysics(handler: (homePhysics: PlayerPhysicsProfile[], awayPhysics: PlayerPhysicsProfile[]) => void): void {
+    this.playerPhysicsHandler = handler;
   }
 
   onServerForfeit(handler: (message: string, finalScore?: ScoreState | null) => void): void {
@@ -351,6 +372,11 @@ export class OnlineMatchTransport implements MatchTransport {
       turn: clock.turnNetworkSide === 'away' ? 'away' : 'home',
       controlEnabled: clock.controlEnabled === true,
     });
+  }
+
+  private applyPlayerPhysics(homePhysics: PlayerPhysicsProfile[] | null | undefined, awayPhysics: PlayerPhysicsProfile[] | null | undefined): void {
+    if ((!homePhysics || homePhysics.length === 0) && (!awayPhysics || awayPhysics.length === 0)) return;
+    this.playerPhysicsHandler?.(homePhysics || [], awayPhysics || []);
   }
 
   private triggerForfeit(message: string, finalScore: ScoreState | null = null): void {

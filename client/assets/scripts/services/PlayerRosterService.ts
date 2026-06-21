@@ -1,11 +1,20 @@
 export type PlayerRarity = 'blue' | 'purple' | 'orange' | 'red';
 
+export interface PlayerPhysicsProfile {
+  actorId?: string;
+  maxDragForceDistance: number;
+  shotPowerScale: number;
+  accuracyLineScale: number;
+  maxCurveAngleRad: number;
+}
+
 export interface RosterPlayer {
   id: string;
   name: string;
   score: number;
   rarity: PlayerRarity;
   avatarSeed: number;
+  physics?: PlayerPhysicsProfile;
 }
 
 export const RARITY_ORDER: Record<PlayerRarity, number> = {

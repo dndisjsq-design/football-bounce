@@ -1,4 +1,4 @@
-import type { RosterPlayer } from './PlayerRosterService';
+import type { PlayerPhysicsProfile, RosterPlayer } from './PlayerRosterService';
 import type { MatchSettlement } from './SingleMatchService';
 import type { MatchEvent, MatchSnapshot, ScoreState, ShootCommand } from '../MatchTypes';
 import { getCurrentAuthToken, getCurrentClientInstanceId, getCurrentDeviceId, getCurrentGuestSessionId, getCurrentUserId, postJson } from './AuthService';
@@ -66,6 +66,8 @@ export interface OnlineResultResponse {
   winnerNetworkSide?: 'home' | 'away' | null;
   loserNetworkSide?: 'home' | 'away' | null;
   finalScore?: ScoreState | null;
+  homePhysics?: PlayerPhysicsProfile[];
+  awayPhysics?: PlayerPhysicsProfile[];
 }
 
 export interface OnlineClockResponse {
@@ -194,7 +196,7 @@ export function submitOnlineResult(matchId: string, requestId: string, commandId
     deviceId: getCurrentDeviceId(),
     authToken: getCurrentAuthToken(),
     clientInstanceId: getCurrentClientInstanceId(),
-  });
+  }, 22000);
 }
 
 export function fetchOnlineSettlement(matchId: string, requestId: string): Promise<OnlineSettlementResponse> {

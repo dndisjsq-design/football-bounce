@@ -1,5 +1,5 @@
 import { MatchEvent, MatchSnapshot, ShootCommand } from '../MatchTypes';
-import { RosterPlayer } from './PlayerRosterService';
+import { PlayerPhysicsProfile, RosterPlayer } from './PlayerRosterService';
 import { getCurrentGuestSessionId, getCurrentUserId, postJson, type UserSummary } from './AuthService';
 
 export interface SingleMatchStartResponse {
@@ -39,6 +39,8 @@ export interface SingleMatchSnapshotResponse {
   valid: boolean;
   message: string;
   expectedSnapshot?: MatchSnapshot;
+  homePhysics?: PlayerPhysicsProfile[];
+  awayPhysics?: PlayerPhysicsProfile[];
 }
 
 export interface MatchSettlementGoal {

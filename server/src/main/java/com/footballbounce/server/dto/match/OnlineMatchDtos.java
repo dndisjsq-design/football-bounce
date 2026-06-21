@@ -1,6 +1,7 @@
 package com.footballbounce.server.dto.match;
 
 import com.footballbounce.server.dto.match.SingleMatchDtos.PlayerSummary;
+import com.footballbounce.server.dto.match.SingleMatchDtos.PlayerPhysicsSummary;
 import com.footballbounce.server.dto.match.SingleMatchDtos.ScoreDto;
 import com.footballbounce.server.dto.match.SingleMatchDtos.SettlementDto;
 import com.footballbounce.server.dto.match.SingleMatchDtos.SnapshotDto;
@@ -141,7 +142,9 @@ public final class OnlineMatchDtos {
             OnlineClockDto clock,
             String winnerNetworkSide,
             String loserNetworkSide,
-            ScoreDto finalScore
+            ScoreDto finalScore,
+            List<PlayerPhysicsSummary> homePhysics,
+            List<PlayerPhysicsSummary> awayPhysics
     ) {
     }
 

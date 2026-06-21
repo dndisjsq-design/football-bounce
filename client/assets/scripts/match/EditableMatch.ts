@@ -3,7 +3,7 @@ import type { MatchSettlementPreview, MatchTransport } from '../MatchTransport';
 import { BallState, DiscBodyState, MatchEvent, MatchMode, MatchSnapshot, PlayerDiskState, ScoreState, ShootCommand, TeamSide } from '../MatchTypes';
 import { getCurrentUserDisplayName } from '../services/AuthService';
 import { getMatchFormationPoints, getMatchFormationPointsById } from '../services/FormationService';
-import { RosterPlayer, getLineupPlayers } from '../services/PlayerRosterService';
+import { PlayerPhysicsProfile, RosterPlayer, getLineupPlayers } from '../services/PlayerRosterService';
 import {
   abandonSingleMatch,
   finishSingleMatch,
@@ -23,8 +23,11 @@ import { findNode, rgba } from '../utils/CocosNodeUtils';
 const MATCH_ID = 'editable-scene-preview';
 const PLAYER_RADIUS = 20;
 const BALL_RADIUS = 13;
-const MAX_DRAG_DISTANCE = 154;
-const PLAYER_SHOT_SPEED = 890;
+const DEFAULT_ACCURACY_REFERENCE_SCALE = 0.9;
+const MAX_DRAG_FORCE_DISTANCE = 149;
+const MAX_DRAG_DISTANCE = PLAYER_RADIUS + MAX_DRAG_FORCE_DISTANCE;
+const PLAYER_SHOT_SPEED = 989;
+const DEFAULT_MAX_CURVE_ANGLE = 50 * Math.PI / 180;
 const PLAYER_MASS = 3.2;
 const BALL_MASS = 0.75;
 const PLAYER_FRICTION = 1.65;
@@ -42,9 +45,7 @@ const GOAL_HALF_WIDTH = 63;
 const GOAL_DEPTH = 30;
 const SOLVER_ITERATIONS = 5;
 const AIM_LAYER_COUNT = 10;
-const AIM_LAYER_LONG_WIDTH = (MAX_DRAG_DISTANCE - PLAYER_RADIUS - 0.5) / AIM_LAYER_COUNT;
 const AIM_LAYER_RATIO = 0.68;
-const MAX_CURVE_ANGLE = 0.92;
 const CURVE_INPUT_DEADZONE = 8;
 const CURVE_MIN_DISTANCE = 34;
 const CORNER_CUSHION_RADIUS = 36;
@@ -137,6 +138,7 @@ export class EditableMatch {
   private singleMatchAwayFormationId = '';
   private singleMatchHomeLineup: Array<RosterPlayer | null> = [];
   private singleMatchAwayLineup: Array<RosterPlayer | null> = [];
+  private playerPhysicsByActorId = new Map<string, PlayerPhysicsProfile>();
   private singleMatchSettlement: MatchSettlement | null = null;
   private replayMatchId = '';
   private replayMode = false;
@@ -178,6 +180,7 @@ export class EditableMatch {
     this.transport.onRemoteShoot((command) => this.applyShootWithFastSettlement(command));
     this.transport.onSnapshot((snapshot) => this.applySnapshot(snapshot));
     this.transport.onClock((clock) => this.applyServerClock(clock.matchRemainingSeconds, clock.turnRemainingSeconds, clock.turn, clock.controlEnabled === true));
+    this.transport.onPlayerPhysics((homePhysics, awayPhysics) => this.applyServerPlayerPhysics(homePhysics, awayPhysics));
     this.transport.onServerForfeit((message, finalScore) => this.forceServerForfeit(message, finalScore || null));
     this.transport.onServerVictory((message, finalScore) => this.forceServerVictory(message, finalScore || null));
     this.transport.setFieldSizeProvider(() => ({ fieldWidth: this.fieldWidth, fieldHeight: this.fieldHeight }));
@@ -242,6 +245,7 @@ export class EditableMatch {
       this.singleMatchAwayFormationId = response.awayFormationId || response.homeFormationId;
       this.singleMatchHomeLineup = normalizeLineup(response.homeLineup);
       this.singleMatchAwayLineup = normalizeLineup(response.awayLineup || response.homeLineup);
+      this.rebuildPlayerPhysicsFromLineups();
       this.resetObjects(response.snapshot?.turn || 'home');
       if (response.snapshot) this.applySnapshot(response.snapshot);
       this.prepareMatchRenderer();
@@ -276,6 +280,7 @@ export class EditableMatch {
       this.singleMatchAwayFormationId = response.record.awayFormationId || response.record.homeFormationId;
       this.singleMatchHomeLineup = normalizeLineup(response.homeLineup);
       this.singleMatchAwayLineup = normalizeLineup(response.awayLineup || response.homeLineup);
+      this.rebuildPlayerPhysicsFromLineups();
       this.score = { home: 0, away: 0 };
       this.matchRemaining = MATCH_SECONDS;
       this.turnRemaining = TURN_SECONDS;
@@ -577,6 +582,7 @@ export class EditableMatch {
         this.beginPenaltyKeeperSwipe(event);
         const current = this.players.find((p) => p.id === playerId);
         if (this.matchEnded || this.goalCelebrationRemaining > 0 || !current || current.side !== 'home' || this.turn !== 'home' || !this.isSettled()) return;
+        if (this.mode === 'ai' && (this.singleMatchValidationPending || this.singleMatchValidationInFlight)) return;
         if (this.mode === 'online' && !this.onlineControlEnabled) return;
         if (this.penaltyShootout && (!this.penaltyAttackerReady || current.id !== this.currentPenaltyKickerId)) return;
         this.dragActor = current;
@@ -687,18 +693,20 @@ export class EditableMatch {
     const dx = this.dragStart.x - this.dragNow.x;
     const dy = this.dragStart.y - this.dragNow.y;
     const rawLen = Math.sqrt(dx * dx + dy * dy);
-    const len = Math.min(rawLen, MAX_DRAG_DISTANCE);
-    const power = clamp((len - this.dragActor.radius) / (MAX_DRAG_DISTANCE - this.dragActor.radius), 0, 1);
-    if (rawLen > this.dragActor.radius && power > 0) {
+    const maxDragDistance = this.maxDragDistanceForActor(this.dragActor);
+    const len = Math.min(rawLen, maxDragDistance);
+    const normalizedPower = clamp((len - this.dragActor.radius) / (maxDragDistance - this.dragActor.radius), 0, 1);
+    const shotPower = normalizedPower * this.powerScaleForActor(this.dragActor);
+    if (rawLen > this.dragActor.radius && normalizedPower > 0) {
       const curveAngleRad = this.curveAngleFromSecondTouch(rawLen);
-      const curveDistance = this.curveDistanceForShot(power);
+      const curveDistance = this.curveDistanceForShot(normalizedPower);
       this.submitShoot({
         commandId: nextId('shoot'),
         matchId: this.activeMatchId,
         actorId: this.dragActor.id,
         side: this.turn,
         angleRad: Math.atan2(dy, dx),
-        power,
+        power: shotPower,
         curveAngleRad,
         curveDistance,
         fieldWidth: this.fieldWidth,
@@ -745,11 +753,12 @@ export class EditableMatch {
     if (!actor || actor.side !== command.side || command.side !== this.turn || !this.isSettled()) return false;
     if (this.penaltyShootout && (!this.penaltyAttackerReady || actor.id !== this.currentPenaltyKickerId)) return false;
     this.appliedCommandIds.add(command.commandId);
-    const curveAngle = clamp(command.curveAngleRad || 0, -MAX_CURVE_ANGLE, MAX_CURVE_ANGLE);
+    const curveMax = this.maxCurveAngleForActor(actor);
+    const curveAngle = clamp(command.curveAngleRad || 0, -curveMax, curveMax);
     const curveDistance = Math.max(0, command.curveDistance || 0);
     const hasCurve = Math.abs(curveAngle) > 0.03 && curveDistance > CURVE_MIN_DISTANCE;
     const shotAngle = command.angleRad + (hasCurve ? curveAngle : 0);
-    const speed = PLAYER_SHOT_SPEED * Math.max(0, command.power);
+    const speed = PLAYER_SHOT_SPEED * clamp(command.power, 0, this.powerScaleForActor(actor));
     actor.vx = Math.cos(shotAngle) * speed;
     actor.vy = Math.sin(shotAngle) * speed;
     this.physicsAccumulator = 0;
@@ -1925,19 +1934,21 @@ export class EditableMatch {
     const dx = this.dragStart.x - this.dragNow.x;
     const dy = this.dragStart.y - this.dragNow.y;
     const rawLen = Math.sqrt(dx * dx + dy * dy);
-    const len = Math.min(rawLen, MAX_DRAG_DISTANCE);
+    const maxDragDistance = this.maxDragDistanceForActor(this.dragActor);
+    const len = Math.min(rawLen, maxDragDistance);
     const g = this.getAimGraphics();
     if (!g || rawLen <= this.dragActor.radius) {
       this.aimGraphics?.clear();
       return;
     }
-    const power = clamp((len - this.dragActor.radius) / (MAX_DRAG_DISTANCE - this.dragActor.radius), 0, 1);
+    const power = clamp((len - this.dragActor.radius) / (maxDragDistance - this.dragActor.radius), 0, 1);
     const scaledLayers = clamp(power * AIM_LAYER_COUNT, 0, AIM_LAYER_COUNT);
     const layerCount = Math.max(1, Math.ceil(scaledLayers));
     const outerLayerFraction = scaledLayers % 1 || 1;
     const innerLongRadius = this.dragActor.radius + 0.5;
     const innerShortRadius = this.dragActor.radius + 0.5;
-    const outerLongRadius = innerLongRadius + (layerCount - 1 + outerLayerFraction) * AIM_LAYER_LONG_WIDTH;
+    const aimLayerLongWidth = this.aimLayerLongWidthForActor(this.dragActor);
+    const outerLongRadius = innerLongRadius + (layerCount - 1 + outerLayerFraction) * aimLayerLongWidth;
     const curveAngleRad = this.curveAngleFromSecondTouch(rawLen);
     const nx = dx / (rawLen || 1);
     const ny = dy / (rawLen || 1);
@@ -1947,7 +1958,7 @@ export class EditableMatch {
     g.node.angle = 0;
     for (let layer = layerCount; layer >= 1; layer--) {
       const widthRatio = layer === layerCount ? outerLayerFraction : 1;
-      const longRadius = innerLongRadius + (layer - 1 + widthRatio) * AIM_LAYER_LONG_WIDTH;
+      const longRadius = innerLongRadius + (layer - 1 + widthRatio) * aimLayerLongWidth;
       const shortRadius = innerShortRadius + (longRadius - innerLongRadius) * AIM_LAYER_RATIO;
       const t = (AIM_LAYER_COUNT - layerCount + layer - 1) / (AIM_LAYER_COUNT - 1);
       g.fillColor = rgba(
@@ -1961,7 +1972,8 @@ export class EditableMatch {
     }
 
     const start = this.dragActor.radius + 8;
-    const lineEnd = outerLongRadius * 2;
+    const fullAccuracyLineEnd = Math.ceil((outerLongRadius * 2) / DEFAULT_ACCURACY_REFERENCE_SCALE);
+    const lineEnd = fullAccuracyLineEnd * this.accuracyScaleForActor(this.dragActor);
     const dotSpacing = 15;
     const path = this.buildReflectedAimPath(start, lineEnd, curveAngleRad, nx, ny);
     if (Math.abs(curveAngleRad) > 0.03) {
@@ -1976,7 +1988,8 @@ export class EditableMatch {
     const signedOffset = this.curveCurrentOffset;
     if (Math.abs(signedOffset) <= CURVE_INPUT_DEADZONE) return 0;
     const curve = clamp((Math.abs(signedOffset) - CURVE_INPUT_DEADZONE) / Math.max(1, rawLen * 0.45), 0, 1);
-    return signedOffset >= 0 ? curve * MAX_CURVE_ANGLE : -curve * MAX_CURVE_ANGLE;
+    const maxCurveAngle = this.maxCurveAngleForActor(this.dragActor);
+    return signedOffset >= 0 ? curve * maxCurveAngle : -curve * maxCurveAngle;
   }
 
   private updateCurveOffsetFromTouch(): void {
@@ -1995,7 +2008,7 @@ export class EditableMatch {
   }
 
   private curveDistanceForShot(power: number): number {
-    const aimRadius = this.dragActor ? this.dragActor.radius + power * (MAX_DRAG_DISTANCE - this.dragActor.radius) : MAX_DRAG_DISTANCE;
+    const aimRadius = this.dragActor ? this.dragActor.radius + power * this.physicsForActor(this.dragActor).maxDragForceDistance : MAX_DRAG_DISTANCE;
     return Math.max(CURVE_MIN_DISTANCE, aimRadius * 2);
   }
 
@@ -2224,6 +2237,39 @@ export class EditableMatch {
     g.close();
   }
 
+  private lineupPlayerForActor(actor: PlayerDiskState | string): RosterPlayer | null {
+    const actorId = typeof actor === 'string' ? actor : actor.id;
+    const side: TeamSide = actorId.startsWith('away-') ? 'away' : 'home';
+    return this.matchLineup(side)[playerSlotIndex(actorId)] || null;
+  }
+
+  private physicsForActor(actor: PlayerDiskState | string): PlayerPhysicsProfile {
+    const actorId = typeof actor === 'string' ? actor : actor.id;
+    return this.playerPhysicsByActorId.get(actorId)
+      || this.lineupPlayerForActor(actorId)?.physics
+      || defaultPlayerPhysics();
+  }
+
+  private powerScaleForActor(actor: PlayerDiskState | string): number {
+    return this.physicsForActor(actor).shotPowerScale;
+  }
+
+  private accuracyScaleForActor(actor: PlayerDiskState | string): number {
+    return this.physicsForActor(actor).accuracyLineScale;
+  }
+
+  private maxCurveAngleForActor(actor: PlayerDiskState | string): number {
+    return this.physicsForActor(actor).maxCurveAngleRad;
+  }
+
+  private maxDragDistanceForActor(actor: PlayerDiskState): number {
+    return actor.radius + this.physicsForActor(actor).maxDragForceDistance;
+  }
+
+  private aimLayerLongWidthForActor(actor: PlayerDiskState): number {
+    return Math.max(1, (this.maxDragDistanceForActor(actor) - actor.radius - 0.5) / AIM_LAYER_COUNT);
+  }
+
   private matchLineup(side: TeamSide): Array<RosterPlayer | null> {
     if (this.replayMode || this.usesServerLineup()) {
       return side === 'home' ? this.singleMatchHomeLineup : this.singleMatchAwayLineup;
@@ -2243,7 +2289,37 @@ export class EditableMatch {
     this.singleMatchAwayFormationId = this.onlineMatch.awayFormationId || '';
     this.singleMatchHomeLineup = normalizeLineup(this.onlineMatch.homeLineup);
     this.singleMatchAwayLineup = normalizeLineup(this.onlineMatch.awayLineup);
+    this.rebuildPlayerPhysicsFromLineups();
     this.onlineInitialSnapshot = this.onlineMatch.snapshot ? this.snapshotInLocalField(this.onlineMatch.snapshot) : null;
+  }
+
+  private rebuildPlayerPhysicsFromLineups(): void {
+    this.playerPhysicsByActorId.clear();
+    this.applyPlayerPhysicsProfiles('home', this.physicsProfilesFromLineup('home', this.singleMatchHomeLineup));
+    this.applyPlayerPhysicsProfiles('away', this.physicsProfilesFromLineup('away', this.singleMatchAwayLineup));
+  }
+
+  private physicsProfilesFromLineup(side: TeamSide, lineup: Array<RosterPlayer | null>): PlayerPhysicsProfile[] {
+    const profiles: PlayerPhysicsProfile[] = [];
+    for (let index = 0; index < lineup.length; index += 1) {
+      const physics = lineup[index]?.physics;
+      if (physics) profiles.push({ ...physics, actorId: `${side}-${index + 1}` });
+    }
+    return profiles;
+  }
+
+  private applyPlayerPhysicsProfiles(side: TeamSide, profiles: PlayerPhysicsProfile[] | null | undefined): void {
+    const list = profiles || [];
+    for (let i = 0; i < list.length; i += 1) {
+      const profile = list[i];
+      const actorId = profile.actorId || `${side}-${i + 1}`;
+      this.playerPhysicsByActorId.set(actorId, { ...profile, actorId });
+    }
+  }
+
+  private applyServerPlayerPhysics(homePhysics: PlayerPhysicsProfile[] | null | undefined, awayPhysics: PlayerPhysicsProfile[] | null | undefined): void {
+    this.applyPlayerPhysicsProfiles('home', homePhysics);
+    this.applyPlayerPhysicsProfiles('away', awayPhysics);
   }
 
   private onlineInitialLocalTurn(): TeamSide {
@@ -2296,6 +2372,7 @@ export class EditableMatch {
           this.forceServerForfeit(response.message || '服务端校验失败');
           return;
         }
+        this.applyServerPlayerPhysics(response.homePhysics, response.awayPhysics);
         this.singleMatchValidationPending = false;
       })
       .catch(() => this.forceServerForfeit('无法向后端提交停止快照'))
@@ -2306,7 +2383,11 @@ export class EditableMatch {
 
   private syncSingleMatchKickoffReset(): void {
     if (this.mode !== 'ai' || !this.singleMatchServerReady) return;
-    void validateSingleMatchSnapshot(this.activeMatchId, this.createSnapshot(), 'kickoff-reset').catch(() => undefined);
+    void validateSingleMatchSnapshot(this.activeMatchId, this.createSnapshot(), 'kickoff-reset')
+      .then((response) => {
+        if (response.ok && response.valid) this.applyServerPlayerPhysics(response.homePhysics, response.awayPhysics);
+      })
+      .catch(() => undefined);
   }
 
   private requestServerPenaltyKeeperMove(): void {
@@ -3031,6 +3112,15 @@ function normalizeLineup(players: RosterPlayer[] | null | undefined): Array<Rost
     lineup.push(players?.[index] || null);
   }
   return lineup;
+}
+
+function defaultPlayerPhysics(): PlayerPhysicsProfile {
+  return {
+    maxDragForceDistance: MAX_DRAG_FORCE_DISTANCE,
+    shotPowerScale: 1,
+    accuracyLineScale: 1,
+    maxCurveAngleRad: DEFAULT_MAX_CURVE_ANGLE,
+  };
 }
 
 function makePlayer(id: string, side: TeamSide, x: number, y: number): PlayerDiskState {

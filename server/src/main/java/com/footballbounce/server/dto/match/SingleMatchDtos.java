@@ -11,12 +11,22 @@ public final class SingleMatchDtos {
     public record StartRequest(Long userId, String clientSessionId, Double fieldWidth, Double fieldHeight) {
     }
 
+    public record PlayerPhysicsSummary(
+            String actorId,
+            double maxDragForceDistance,
+            double shotPowerScale,
+            double accuracyLineScale,
+            double maxCurveAngleRad
+    ) {
+    }
+
     public record PlayerSummary(
             String id,
             String name,
             int score,
             String rarity,
-            int avatarSeed
+            int avatarSeed,
+            PlayerPhysicsSummary physics
     ) {
     }
 
@@ -105,7 +115,9 @@ public final class SingleMatchDtos {
             boolean ok,
             boolean valid,
             String message,
-            SnapshotDto expectedSnapshot
+            SnapshotDto expectedSnapshot,
+            List<PlayerPhysicsSummary> homePhysics,
+            List<PlayerPhysicsSummary> awayPhysics
     ) {
     }
 

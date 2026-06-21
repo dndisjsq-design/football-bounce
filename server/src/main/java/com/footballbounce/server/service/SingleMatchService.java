@@ -15,6 +15,7 @@ import com.footballbounce.server.dto.match.SingleMatchDtos.FinishRequest;
 import com.footballbounce.server.dto.match.SingleMatchDtos.FinishResponse;
 import com.footballbounce.server.dto.match.SingleMatchDtos.MatchEventRequest;
 import com.footballbounce.server.dto.match.SingleMatchDtos.MatchEventResponse;
+import com.footballbounce.server.dto.match.SingleMatchDtos.PlayerPhysicsSummary;
 import com.footballbounce.server.dto.match.SingleMatchDtos.PlayerSummary;
 import com.footballbounce.server.dto.match.SingleMatchDtos.ScoreDto;
 import com.footballbounce.server.dto.match.SingleMatchDtos.SettlementDto;
@@ -51,7 +52,12 @@ public class SingleMatchService {
     private static final double DEFAULT_FIELD_HEIGHT = 650;
     private static final double PLAYER_RADIUS = 20;
     private static final double BALL_RADIUS = 13;
-    private static final double PLAYER_SHOT_SPEED = 890;
+    private static final double PLAYER_SHOT_SPEED = 989;
+    private static final double ABILITY_FULL_SCORE = 100.0;
+    private static final int DEFAULT_ABILITY_SCORE = 100;
+    private static final double CURVE_DEGREES_TO_RADIANS = Math.PI / 180.0;
+    private static final double MAX_DRAG_FORCE_DISTANCE = 149;
+    private static final double MAX_CURVE_ANGLE_AT_FULL_SCORE = 50 * CURVE_DEGREES_TO_RADIANS;
     private static final double PLAYER_MASS = 3.2;
     private static final double BALL_MASS = 0.75;
     private static final double PLAYER_FRICTION = 1.65;
@@ -67,7 +73,6 @@ public class SingleMatchService {
     private static final double GOAL_HALF_WIDTH = 63;
     private static final double GOAL_DEPTH = 30;
     private static final int SOLVER_ITERATIONS = 5;
-    private static final double MAX_CURVE_ANGLE = 0.92;
     private static final double CURVE_MIN_DISTANCE = 34;
     private static final double CORNER_CUSHION_RADIUS = 36;
     private static final double CORNER_CUSHION_RESTITUTION = 0.92;
@@ -177,13 +182,14 @@ public class SingleMatchService {
             double actorY = request.actorY() == null ? state.goalLineY() - 174 : request.actorY();
             double targetX = (random.nextDouble() - 0.5) * GOAL_HALF_WIDTH * 1.45;
             double targetY = state.goalLineY() + 8;
+            double maxPower = state.powerScaleForActor(actorId);
             ShootCommandDto command = new ShootCommandDto(
                     "server-ai-penalty-" + System.currentTimeMillis() + "-" + random.nextInt(10000),
                     state.matchNo,
                     actorId,
                     "away",
                     Math.atan2(targetY - actorY, targetX - actorX),
-                    0.72 + random.nextDouble() * 0.18,
+                    maxPower * (0.72 + random.nextDouble() * 0.18),
                     0.0,
                     0.0,
                     state.fieldWidth,
@@ -203,13 +209,14 @@ public class SingleMatchService {
         if (actor == null) {
             return new AiShootResponse(false, "人机阵容为空", null, state.snapshot());
         }
+        double maxPower = state.powerScaleForActor(actor.id);
         ShootCommandDto command = new ShootCommandDto(
                 "server-ai-" + System.currentTimeMillis() + "-" + random.nextInt(10000),
                 state.matchNo,
                 actor.id,
                 "away",
                 Math.atan2(state.ball.y - actor.y, state.ball.x - actor.x),
-                0.66 + random.nextDouble() * 0.08,
+                maxPower * (0.66 + random.nextDouble() * 0.08),
                 0.0,
                 0.0,
                 state.fieldWidth,
@@ -238,14 +245,14 @@ public class SingleMatchService {
     public SnapshotValidationResponse validateSnapshot(SnapshotValidationRequest request) {
         ServerMatchState state = matches.get(request.matchId());
         if (state == null) {
-            return new SnapshotValidationResponse(false, false, "比赛不存在或已过期", null);
+            return new SnapshotValidationResponse(false, false, "比赛不存在或已过期", null, List.of(), List.of());
         }
         SnapshotDto incoming = request.snapshot();
         String phase = request.phase() == null ? "" : request.phase().trim().toLowerCase(Locale.ROOT);
         if ("kickoff-reset".equals(phase)) {
             state.replaceFromSnapshot(incoming);
             recordAction(state, incoming.turn(), null, "kickoff-reset", null, true, "kickoff reset accepted");
-            return new SnapshotValidationResponse(true, true, "开球快照已同步", state.snapshot());
+            return new SnapshotValidationResponse(true, true, "开球快照已同步", state.snapshot(), state.physicsForSide("home"), state.physicsForSide("away"));
         }
         SnapshotDto expected = state.snapshot();
         String mismatch = state.compareSnapshot(incoming);
@@ -255,7 +262,14 @@ public class SingleMatchService {
             expected = state.snapshot();
         }
         recordAction(state, incoming.turn(), null, "snapshot-validate", null, valid, valid ? "valid" : mismatch);
-        return new SnapshotValidationResponse(true, valid, valid ? "校验通过" : mismatch, expected);
+        return new SnapshotValidationResponse(
+                true,
+                valid,
+                valid ? "校验通过" : mismatch,
+                expected,
+                valid ? state.physicsForSide("home") : List.of(),
+                valid ? state.physicsForSide("away") : List.of()
+        );
     }
 
     @Transactional
@@ -324,7 +338,8 @@ public class SingleMatchService {
                     stringValue(row.get("name")),
                     intValue(row.get("score")),
                     stringValue(row.get("rarity")),
-                    intValue(row.get("avatarSeed"))
+                    intValue(row.get("avatarSeed")),
+                    physicsFromRow(row)
             );
             byId.put(player.id(), player);
         }
@@ -433,6 +448,68 @@ public class SingleMatchService {
         } catch (NumberFormatException ex) {
             return 0;
         }
+    }
+
+    private static int abilityScore(Object value) {
+        if (value == null) {
+            return DEFAULT_ABILITY_SCORE;
+        }
+        int score;
+        if (value instanceof Number number) {
+            score = number.intValue();
+        } else {
+            String text = String.valueOf(value).trim();
+            if (text.isEmpty()) {
+                return DEFAULT_ABILITY_SCORE;
+            }
+            try {
+                score = Integer.parseInt(text);
+            } catch (NumberFormatException ex) {
+                return DEFAULT_ABILITY_SCORE;
+            }
+        }
+        return Math.max(0, score);
+    }
+
+    private static double abilityMultiplier(Object value) {
+        int score = abilityScore(value);
+        if (score <= ABILITY_FULL_SCORE) {
+            return score / ABILITY_FULL_SCORE;
+        }
+        double extra = score - ABILITY_FULL_SCORE;
+        return 1 + 0.035 * extra + 0.006 * extra * extra;
+    }
+
+    private static PlayerPhysicsSummary physicsFromRow(Map<String, Object> row) {
+        return physicsWithActorId(
+                "",
+                abilityMultiplier(row.get("power")),
+                abilityMultiplier(row.get("accuracy")),
+                abilityMultiplier(row.get("curve"))
+        );
+    }
+
+    private static PlayerPhysicsSummary physicsWithActorId(String actorId, PlayerPhysicsSummary physics) {
+        if (physics == null) {
+            return physicsWithActorId(actorId, 1, 1, 1);
+        }
+        return new PlayerPhysicsSummary(
+                actorId,
+                physics.maxDragForceDistance(),
+                physics.shotPowerScale(),
+                physics.accuracyLineScale(),
+                physics.maxCurveAngleRad()
+        );
+    }
+
+    private static PlayerPhysicsSummary physicsWithActorId(String actorId, double powerMultiplier, double accuracyMultiplier, double curveMultiplier) {
+        return new PlayerPhysicsSummary(
+                actorId,
+                MAX_DRAG_FORCE_DISTANCE * powerMultiplier,
+                powerMultiplier,
+                accuracyMultiplier,
+                MAX_CURVE_ANGLE_AT_FULL_SCORE * curveMultiplier
+        );
     }
 
     private static int rarityRank(String rarity) {
@@ -648,6 +725,32 @@ public class SingleMatchService {
             return player == null ? playerId : player.name();
         }
 
+        private PlayerSummary playerForActor(String actorId) {
+            return lineupByPlayerId.get(playerIdForActor(actorId));
+        }
+
+        private List<PlayerPhysicsSummary> physicsForSide(String side) {
+            String actorSide = "away".equals(side) ? "away" : "home";
+            List<PlayerPhysicsSummary> result = new ArrayList<>();
+            for (int i = 0; i < lineupIds.size(); i += 1) {
+                PlayerSummary player = lineupByPlayerId.get(lineupIds.get(i));
+                if (player != null) {
+                    result.add(physicsWithActorId(actorSide + "-" + (i + 1), player.physics()));
+                }
+            }
+            return result;
+        }
+
+        private double powerScaleForActor(String actorId) {
+            PlayerSummary player = playerForActor(actorId);
+            return player == null || player.physics() == null ? 1 : player.physics().shotPowerScale();
+        }
+
+        private double maxCurveAngleForActor(String actorId) {
+            PlayerSummary player = playerForActor(actorId);
+            return player == null || player.physics() == null ? MAX_CURVE_ANGLE_AT_FULL_SCORE : player.physics().maxCurveAngleRad();
+        }
+
         private void recordGoal(MatchEventRequest request, SingleMatchMapper mapper) {
             String eventId = request.eventId() == null ? "" : request.eventId();
             if (!eventId.isBlank() && !recordedGoalEvents.add(eventId)) {
@@ -762,11 +865,12 @@ public class SingleMatchService {
             if (actor == null || !actor.side.equals(command.side()) || !command.side().equals(turn) || !isSettled()) {
                 return false;
             }
-            double curveAngle = clamp(command.curveAngleRad() == null ? 0 : command.curveAngleRad(), -MAX_CURVE_ANGLE, MAX_CURVE_ANGLE);
+            double maxCurveAngle = maxCurveAngleForActor(actor.id);
+            double curveAngle = clamp(command.curveAngleRad() == null ? 0 : command.curveAngleRad(), -maxCurveAngle, maxCurveAngle);
             double curveDistance = Math.max(0, command.curveDistance() == null ? 0 : command.curveDistance());
             boolean hasCurve = Math.abs(curveAngle) > 0.03 && curveDistance > CURVE_MIN_DISTANCE;
             double shotAngle = command.angleRad() + (hasCurve ? curveAngle : 0);
-            double speed = PLAYER_SHOT_SPEED * clamp(command.power(), 0, 1);
+            double speed = PLAYER_SHOT_SPEED * clamp(command.power(), 0, powerScaleForActor(actor.id));
             actor.vx = Math.cos(shotAngle) * speed;
             actor.vy = Math.sin(shotAngle) * speed;
             activeCurves.clear();
