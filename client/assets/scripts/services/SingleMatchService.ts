@@ -1,5 +1,5 @@
 import { MatchEvent, MatchSnapshot, ShootCommand } from '../MatchTypes';
-import { PlayerPhysicsProfile, RosterPlayer } from './PlayerRosterService';
+import { RosterPlayer } from './PlayerRosterService';
 import { getCurrentGuestSessionId, getCurrentUserId, postJson, type UserSummary } from './AuthService';
 
 export interface SingleMatchStartResponse {
@@ -18,29 +18,18 @@ export interface SingleMatchStartResponse {
 export interface SingleMatchShootResponse {
   ok: boolean;
   message: string;
-  expectedSnapshot?: MatchSnapshot;
 }
 
 export interface SingleMatchAiShootResponse {
   ok: boolean;
   message: string;
   command?: ShootCommand;
-  expectedSnapshot?: MatchSnapshot;
 }
 
 export interface SingleMatchAiKeeperResponse {
   ok: boolean;
   message: string;
   direction: -1 | 0 | 1;
-}
-
-export interface SingleMatchSnapshotResponse {
-  ok: boolean;
-  valid: boolean;
-  message: string;
-  expectedSnapshot?: MatchSnapshot;
-  homePhysics?: PlayerPhysicsProfile[];
-  awayPhysics?: PlayerPhysicsProfile[];
 }
 
 export interface MatchSettlementGoal {
@@ -103,17 +92,6 @@ export function requestSingleMatchAiShoot(
 
 export function requestSingleMatchAiKeeper(matchId: string): Promise<SingleMatchAiKeeperResponse> {
   return postJson<SingleMatchAiKeeperResponse>('/single-match/ai-keeper', { matchId });
-}
-
-export function validateSingleMatchSnapshot(matchId: string, snapshot: MatchSnapshot, phase = 'settled'): Promise<SingleMatchSnapshotResponse> {
-  return postJson<SingleMatchSnapshotResponse>('/single-match/snapshot', {
-    matchId,
-    phase,
-    snapshot: {
-      ...snapshot,
-      matchId,
-    },
-  });
 }
 
 export function sendSingleMatchEvent(matchId: string, event: MatchEvent): Promise<{ ok: boolean; message: string }> {

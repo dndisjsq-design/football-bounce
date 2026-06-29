@@ -10,7 +10,7 @@ Last updated: 2026-06-21
 
 This document records the match-only client/server message flow in actual runtime order.
 
-The current implementation uses HTTP POST APIs. Online match synchronization uses normal polling for clock data and long polling for opponent actions. It is not WebSocket push yet.
+The current implementation uses HTTP POST APIs for all online match messages. `clock` is only a time poll; opponent actions are fetched through `/online-match/opponent-action` only when `turn-request` says it is not the local player's turn.
 
 ## 2. Common Rules
 
@@ -27,14 +27,14 @@ Most online-match requests include these identity/session fields:
 - `authToken`: login token for real accounts.
 - `clientInstanceId`: one runtime instance id, used to distinguish two app instances on the same device.
 
-The repeated identity fields are currently used because the HTTP API is stateless. Each request validates that the caller is still the same logged-in user/session. This can be optimized later with a shorter match session token or WebSocket session binding.
+The repeated identity fields are currently used because the HTTP API is stateless. Each request validates that the caller is still the same logged-in user/session. This can be optimized later with a shorter match session token.
 
 Field size fields:
 
 - `fieldWidth`
 - `fieldHeight`
 
-These are sent by online match requests because the backend converts commands and snapshots between each client's actual field size and the canonical server field. They are not business data, but they are required by the current snapshot/command scaling logic.
+These are sent by online match requests because the backend converts commands and returned opponent actions between each client's actual field size and the canonical server field. They are not business data, but they are required by the current command scaling logic.
 
 ## 3. Shared Match DTOs
 
@@ -439,7 +439,8 @@ Client-side rule:
 After entering the match scene, the online transport starts:
 
 - `/online-match/clock` every 200 ms.
-- `/online-match/actions` as a long-poll loop.
+- `/online-match/opponent-action` every 250 ms only while waiting for the opponent's operation.
+- Event-triggered `/online-match/turn-request` after ready, after local movement settles, after goal celebration, and when clock reaches zero.
 
 ### 5.5 Clock Poll
 
@@ -452,8 +453,6 @@ Client sends:
   "userId": 2,
   "requestId": "mm-...",
   "matchId": "...",
-  "fieldWidth": 390,
-  "fieldHeight": 650,
   "deviceId": "fb-...",
   "authToken": "...",
   "clientInstanceId": "instance-..."
@@ -470,39 +469,38 @@ Server returns:
     "serverTimeMillis": 1234567890,
     "matchRemainingSeconds": 160.5,
     "turnRemainingSeconds": 11.2,
-    "turnNetworkSide": "home",
-    "controlEnabled": true
-  },
-  "winnerNetworkSide": null,
-  "loserNetworkSide": null,
-  "finalScore": null
+    "paused": false,
+    "pauseReason": ""
+  }
 }
 ```
 
 Current behavior:
 
 - Identity fields are sent every time because the HTTP API is stateless.
-- `fieldWidth` and `fieldHeight` are sent every time so backend scaling stays aligned with the current client field.
-- `/clock` only returns time, turn, control state, and possible match-end fields.
-- Player physics limits are not returned by `/clock`; they are returned by confirmed `/online-match/result` responses.
+- `/clock` only returns time data. It does not advance runtime, return snapshots, return winner fields, or unlock input.
+- When `clock.paused=true` and `pauseReason="goal"`, goal celebration is in progress and both match time and turn time stay fixed.
+- Player physics limits are not returned by `/clock`; they are returned by `/online-match/turn-request` when the server unlocks the local player's turn.
 
 Possible optimization:
 
 - After a match is established, the backend could issue a short match-session token and avoid repeating full auth fields.
 - If field size is stable after scene load, the client could send it once and only resend when it changes.
-- If WebSocket is introduced, clock updates can be server-pushed instead of requested every 200 ms.
+- Clock remains an explicitly authorized time-only poll. Do not add score, winner, opponent action, or physics-cap fields to it.
 
-### 5.6 Opponent Action Long Poll
+### 5.6 Opponent Action Poll
+
+Opponent actions are queried by the non-controlling client after `/online-match/turn-request` returns `canControl=false` with a "not your turn" message.
 
 Client sends:
 
-`POST /api/online-match/actions`
+`POST /api/online-match/opponent-action`
 
 ```json
 {
   "userId": 2,
   "requestId": "mm-...",
-  "matchId": "...",
+  "matchId": "online-...",
   "sinceSeq": 12,
   "fieldWidth": 390,
   "fieldHeight": 650,
@@ -512,37 +510,32 @@ Client sends:
 }
 ```
 
-Server returns:
+Server returns one next localized opponent action at most:
 
 ```json
 {
   "ok": true,
-  "message": "ok",
+  "message": "收到对手操作",
   "actions": [
     {
       "seq": 13,
-      "actorUserId": 3,
+      "actorUserId": 2,
       "actorRequestId": "mm-...",
       "actorNetworkSide": "away",
       "command": {}
     }
   ],
   "nextSeq": 13,
-  "clock": {},
-  "winnerNetworkSide": null,
-  "loserNetworkSide": null,
-  "finalScore": null
+  "clock": {}
 }
 ```
 
 Important clarification:
 
-- Current implementation is long polling, not backend push.
-- The frontend sends `/actions` and the backend can hold the request until an action appears or a timeout/deadline is reached.
-- After receiving a response, the frontend immediately starts the next `/actions` request.
-- The backend does not actively send data without a client request under the current HTTP implementation.
-
-If real backend-to-client push is required, replace this with WebSocket or SSE. For action sync in a real-time game, WebSocket is the better long-term choice.
+- If the opponent has not operated yet, the server returns `ok=true`, message `等待对手操作`, an empty `actions` array, and a `nextSeq` that the client should reuse for the next poll.
+- The client stops polling as soon as it receives one opponent action, obtains local control, disconnects, or the match ends.
+- `/clock` remains a client-initiated time poll.
+- `/turn-request` is event-triggered and returns only turn permission, physical caps, and skill trigger placeholders.
 
 ### 5.7 Local Player Shoots
 
@@ -576,13 +569,10 @@ Server returns:
 ```json
 {
   "ok": true,
-  "message": "操作已登记并广播，等待双方结算确认",
+  "message": "操作已登记",
   "actions": [],
   "nextSeq": 13,
-  "clock": {},
-  "winnerNetworkSide": null,
-  "loserNetworkSide": null,
-  "finalScore": null
+  "clock": {}
 }
 ```
 
@@ -590,110 +580,66 @@ Server-side behavior:
 
 - Validates session and turn.
 - Converts local command to canonical field coordinates if needed.
-- Runs server-side physics.
-- Records the accepted action for replay.
-- Publishes the action for the opponent's `/actions` long poll.
+- Validates command limits against the current server-side player physics profile.
+- Applies the command to the server-authoritative realtime runtime state.
+- Records and publishes the accepted action for replay and opponent polling.
+- Does not wait for the opponent client to acknowledge display playback.
 
-### 5.8 Local Result Submission Without Goal
+### 5.8 Player Physical Caps
 
-After local simulation settles, the client sends:
-
-`POST /api/online-match/result`
-
-```json
-{
-  "userId": 2,
-  "requestId": "mm-...",
-  "matchId": "...",
-  "commandId": "shoot-...",
-  "snapshot": {},
-  "fieldWidth": 390,
-  "fieldHeight": 650,
-  "deviceId": "fb-...",
-  "authToken": "...",
-  "clientInstanceId": "instance-..."
-}
-```
+When the server unlocks the local player's turn, `/api/online-match/turn-request` returns current localized physical caps with the permission result.
 
 Server returns:
 
 ```json
 {
   "ok": true,
-  "valid": true,
-  "confirmed": true,
-  "message": "双方结算已确认，下一回合已解锁",
-  "clock": {},
-  "winnerNetworkSide": null,
-  "loserNetworkSide": null,
-  "finalScore": null,
+  "message": "ok",
+  "canControl": true,
   "homePhysics": [],
-  "awayPhysics": []
+  "awayPhysics": [],
+  "skillTriggers": []
 }
 ```
 
-Meanings:
+### 5.9 Goal Score Sync
 
-- `valid=false`: this side failed validation.
-- `confirmed=false`: this side submitted, but the other side has not submitted yet. The current client retries the same result submission after a short delay if this happens.
-- `confirmed=true`: both sides submitted and the next turn can unlock.
-- `homePhysics` and `awayPhysics` are included on confirmed next-turn responses.
+After a local goal event and goal animation, the frontend queries authoritative score:
 
-The server holds this request briefly while waiting for the other side's result, so the first submitter usually receives the final `confirmed=true` response through the same `/result` request instead of relying on `/clock`.
+`POST /api/online-match/score`
 
-### 5.9 Local Result Submission With Goal
-
-If the local simulation detects a goal, the client sends the same endpoint with event fields:
-
-`POST /api/online-match/result`
+Server returns:
 
 ```json
 {
-  "userId": 2,
-  "requestId": "mm-...",
-  "matchId": "...",
-  "commandId": "shoot-...",
-  "snapshot": null,
-  "eventId": "event-...",
-  "eventType": "goal",
-  "eventTick": 1234,
-  "eventSide": "home",
-  "eventActorId": "home-2",
-  "eventMatchSecond": 65,
-  "eventPenalty": false,
-  "eventOwnGoal": false,
-  "eventScore": { "home": 1, "away": 0 },
-  "fieldWidth": 390,
-  "fieldHeight": 650,
-  "deviceId": "fb-...",
-  "authToken": "...",
-  "clientInstanceId": "instance-..."
+  "ok": true,
+  "message": "查询成功",
+  "score": { "home": 1, "away": 0 }
 }
 ```
 
-Server verifies the goal against the server-side expected result. If confirmed, the backend records the goal in the goal table and updates score/turn state.
+This endpoint only returns score. It does not return turn permission, physical caps, winner, loser, or settlement data.
 
-### 5.10 Match End
+### 5.10 Match End Check
 
 The backend owns match-end decisions.
 
-Any of these online responses may indicate match end:
+The frontend calls this when score reaches 3 or clock reaches zero:
 
-- `/online-match/clock`
-- `/online-match/actions`
-- `/online-match/result`
+`POST /api/online-match/finish-check`
 
-End fields:
+Server returns:
 
 ```json
 {
-  "winnerNetworkSide": "home",
-  "loserNetworkSide": "away",
-  "finalScore": { "home": 3, "away": 1 }
+  "ok": true,
+  "message": "允许结束",
+  "canEnd": true,
+  "settlement": {}
 }
 ```
 
-The frontend then plays match-end animation and requests settlement.
+The frontend then plays match-end animation and renders the returned settlement data.
 
 ### 5.11 Online Settlement
 
@@ -747,13 +693,12 @@ Used after replay ends to render the settlement overlay.
 
 ### 7.1 Clock Poll Payload
 
-The current `/online-match/clock` request sends identity and field-size fields every 200 ms. This is heavier than strictly necessary, but it is simple and robust for stateless HTTP.
+The current `/online-match/clock` request sends identity fields every 200 ms. It intentionally does not send field size or ask for state.
 
 What is truly needed every clock tick:
 
 - `matchId`
 - one trusted session identifier
-- optionally field size if it can change
 
 What is currently repeated for safety:
 
@@ -762,28 +707,23 @@ What is currently repeated for safety:
 - `deviceId`
 - `authToken`
 - `clientInstanceId`
-- `fieldWidth`
-- `fieldHeight`
 
 Recommended future optimization:
 
 - On match start, issue a short-lived `matchSessionToken`.
 - Bind the token to user, request, device, client instance, match, and side.
-- Send only `matchId`, `matchSessionToken`, and changed field size.
+- Send only `matchId` and `matchSessionToken`.
 
-### 7.2 Long Poll Versus Server Push
+### 7.2 Opponent Action Poll
 
-Current `/online-match/actions` is long polling:
+Current opponent-action delivery uses an HTTP poll only while the local client is waiting for the opponent:
 
-1. Client sends a request with `sinceSeq`.
-2. Server waits until a new action exists or timeout is reached.
-3. Server returns actions.
-4. Client immediately sends the next request.
+1. Controlling client submits a local shoot command through HTTP.
+2. Server validates, applies, records, and publishes the canonical command.
+3. Non-controlling client polls `/online-match/opponent-action`.
+4. Server returns at most one localized opponent command after `sinceSeq`.
 
-This is not true server push. The backend cannot initiate a response unless the client already has an open HTTP request.
+This keeps real-time action delivery separate from time polling:
 
-For future online gameplay, WebSocket is a better design:
-
-- One connection per match client.
-- Server pushes opponent actions, clock corrections, match-end events, and skill/physics updates.
-- Client sends commands and local result reports on the same connection.
+- `/clock` only returns time.
+- `/turn-request` returns input permission and physical caps.

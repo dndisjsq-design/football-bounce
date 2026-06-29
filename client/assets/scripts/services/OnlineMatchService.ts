@@ -1,6 +1,6 @@
 import type { PlayerPhysicsProfile, RosterPlayer } from './PlayerRosterService';
 import type { MatchSettlement } from './SingleMatchService';
-import type { MatchEvent, MatchSnapshot, ScoreState, ShootCommand } from '../MatchTypes';
+import type { MatchSnapshot, ScoreState, ShootCommand } from '../MatchTypes';
 import { getCurrentAuthToken, getCurrentClientInstanceId, getCurrentDeviceId, getCurrentGuestSessionId, getCurrentUserId, postJson } from './AuthService';
 
 export interface OnlinePlayer {
@@ -42,8 +42,8 @@ export interface OnlineClock {
   serverTimeMillis: number;
   matchRemainingSeconds: number;
   turnRemainingSeconds: number;
-  turnNetworkSide: 'home' | 'away';
-  controlEnabled?: boolean;
+  paused?: boolean;
+  pauseReason?: string;
 }
 
 export interface OnlineActionResponse {
@@ -52,31 +52,49 @@ export interface OnlineActionResponse {
   actions: OnlineAction[];
   nextSeq: number;
   clock?: OnlineClock | null;
-  winnerNetworkSide?: 'home' | 'away' | null;
-  loserNetworkSide?: 'home' | 'away' | null;
-  finalScore?: ScoreState | null;
-}
-
-export interface OnlineResultResponse {
-  ok: boolean;
-  valid: boolean;
-  confirmed?: boolean;
-  message: string;
-  clock?: OnlineClock | null;
-  winnerNetworkSide?: 'home' | 'away' | null;
-  loserNetworkSide?: 'home' | 'away' | null;
-  finalScore?: ScoreState | null;
-  homePhysics?: PlayerPhysicsProfile[];
-  awayPhysics?: PlayerPhysicsProfile[];
 }
 
 export interface OnlineClockResponse {
   ok: boolean;
   message: string;
   clock?: OnlineClock | null;
-  winnerNetworkSide?: 'home' | 'away' | null;
-  loserNetworkSide?: 'home' | 'away' | null;
-  finalScore?: ScoreState | null;
+}
+
+export interface OnlineSkillTrigger {
+  actorId: string;
+  skillId: string;
+  name: string;
+}
+
+export interface OnlineReadyResponse {
+  ok: boolean;
+  message: string;
+  started: boolean;
+  clock?: OnlineClock | null;
+  snapshot?: MatchSnapshot | null;
+}
+
+export interface OnlineTurnResponse {
+  ok: boolean;
+  message: string;
+  canControl: boolean;
+  clock?: OnlineClock | null;
+  homePhysics?: PlayerPhysicsProfile[];
+  awayPhysics?: PlayerPhysicsProfile[];
+  skillTriggers?: OnlineSkillTrigger[];
+}
+
+export interface OnlineScoreResponse {
+  ok: boolean;
+  message: string;
+  score?: ScoreState | null;
+}
+
+export interface OnlineFinishCheckResponse {
+  ok: boolean;
+  message: string;
+  canEnd: boolean;
+  settlement?: MatchSettlement | null;
 }
 
 export interface OnlineSettlementResponse {
@@ -139,6 +157,7 @@ export function submitOnlineShoot(matchId: string, requestId: string, command: S
     power: command.power,
     curveAngleRad: command.curveAngleRad || 0,
     curveDistance: command.curveDistance || 0,
+    noop: command.noop === true,
     fieldWidth: command.fieldWidth,
     fieldHeight: command.fieldHeight,
     clientTick: command.clientTick,
@@ -148,8 +167,45 @@ export function submitOnlineShoot(matchId: string, requestId: string, command: S
   });
 }
 
-export function fetchOnlineActions(matchId: string, requestId: string, sinceSeq: number, fieldSize: MatchFieldSize | null = null): Promise<OnlineActionResponse> {
-  return postJson<OnlineActionResponse>('/online-match/actions', {
+export function fetchOnlineClock(matchId: string, requestId: string): Promise<OnlineClockResponse> {
+  return postJson<OnlineClockResponse>('/online-match/clock', {
+    userId: getCurrentUserId(),
+    requestId,
+    matchId,
+    deviceId: getCurrentDeviceId(),
+    authToken: getCurrentAuthToken(),
+    clientInstanceId: getCurrentClientInstanceId(),
+  }, 7000);
+}
+
+export function submitOnlineReady(matchId: string, requestId: string, fieldSize: MatchFieldSize | null = null): Promise<OnlineReadyResponse> {
+  return postJson<OnlineReadyResponse>('/online-match/ready', {
+    userId: getCurrentUserId(),
+    requestId,
+    matchId,
+    fieldWidth: fieldSize?.fieldWidth,
+    fieldHeight: fieldSize?.fieldHeight,
+    deviceId: getCurrentDeviceId(),
+    authToken: getCurrentAuthToken(),
+    clientInstanceId: getCurrentClientInstanceId(),
+  }, 12000);
+}
+
+export function requestOnlineTurn(matchId: string, requestId: string, fieldSize: MatchFieldSize | null = null): Promise<OnlineTurnResponse> {
+  return postJson<OnlineTurnResponse>('/online-match/turn-request', {
+    userId: getCurrentUserId(),
+    requestId,
+    matchId,
+    fieldWidth: fieldSize?.fieldWidth,
+    fieldHeight: fieldSize?.fieldHeight,
+    deviceId: getCurrentDeviceId(),
+    authToken: getCurrentAuthToken(),
+    clientInstanceId: getCurrentClientInstanceId(),
+  }, 8000);
+}
+
+export function fetchOnlineOpponentAction(matchId: string, requestId: string, sinceSeq: number, fieldSize: MatchFieldSize | null = null): Promise<OnlineActionResponse> {
+  return postJson<OnlineActionResponse>('/online-match/opponent-action', {
     userId: getCurrentUserId(),
     requestId,
     matchId,
@@ -159,44 +215,30 @@ export function fetchOnlineActions(matchId: string, requestId: string, sinceSeq:
     deviceId: getCurrentDeviceId(),
     authToken: getCurrentAuthToken(),
     clientInstanceId: getCurrentClientInstanceId(),
-  }, 6000);
+  }, 3000);
 }
 
-export function fetchOnlineClock(matchId: string, requestId: string, fieldSize: MatchFieldSize | null = null): Promise<OnlineClockResponse> {
-  return postJson<OnlineClockResponse>('/online-match/clock', {
+export function fetchOnlineScore(matchId: string, requestId: string): Promise<OnlineScoreResponse> {
+  return postJson<OnlineScoreResponse>('/online-match/score', {
     userId: getCurrentUserId(),
     requestId,
     matchId,
-    fieldWidth: fieldSize?.fieldWidth,
-    fieldHeight: fieldSize?.fieldHeight,
     deviceId: getCurrentDeviceId(),
     authToken: getCurrentAuthToken(),
     clientInstanceId: getCurrentClientInstanceId(),
   }, 3000);
 }
 
-export function submitOnlineResult(matchId: string, requestId: string, commandId: string, snapshot: MatchSnapshot | null, event: MatchEvent | null = null, fieldSize: MatchFieldSize | null = null): Promise<OnlineResultResponse> {
-  return postJson<OnlineResultResponse>('/online-match/result', {
+export function checkOnlineFinish(matchId: string, requestId: string): Promise<OnlineFinishCheckResponse> {
+  return postJson<OnlineFinishCheckResponse>('/online-match/finish-check', {
     userId: getCurrentUserId(),
     requestId,
     matchId,
-    commandId,
-    snapshot,
-    fieldWidth: snapshot?.fieldWidth ?? fieldSize?.fieldWidth,
-    fieldHeight: snapshot?.fieldHeight ?? fieldSize?.fieldHeight,
-    eventId: event?.eventId,
-    eventType: event?.type,
-    eventTick: event?.tick,
-    eventSide: event?.side,
-    eventActorId: event?.actorId,
-    eventMatchSecond: event?.matchSecond,
-    eventPenalty: event?.penalty,
-    eventOwnGoal: event?.ownGoal,
-    eventScore: event?.score,
+    guestSessionId: getCurrentGuestSessionId(),
     deviceId: getCurrentDeviceId(),
     authToken: getCurrentAuthToken(),
     clientInstanceId: getCurrentClientInstanceId(),
-  }, 22000);
+  }, 5000);
 }
 
 export function fetchOnlineSettlement(matchId: string, requestId: string): Promise<OnlineSettlementResponse> {

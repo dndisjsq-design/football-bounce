@@ -35,7 +35,7 @@ Current style:
 - Cocos Creator client for rendering, input, animation, local scene flow, and current match prediction.
 - Spring Boot backend for accounts, inventory, wallet, lineups, shop purchases, match records, rewards, single-match server logic, online runtime state, online clock, and online validation.
 - MySQL for durable state.
-- HTTP polling for online match synchronization.
+- HTTP polling only for online clock synchronization; online gameplay requests are event-triggered unless explicitly approved.
 
 Target style:
 
@@ -118,7 +118,8 @@ Client must not be the source of truth for:
 
 Current gap:
 
-- Online and single match still use client-side physics and fast settlement preview as part of the validation path. This is not final server-authoritative architecture.
+- Online match no longer submits client fast-settlement snapshots. The server owns online realtime physics state, clocks, score, goal records, and finish decisions.
+- Single match still contains legacy server-side fast simulation for AI command/result bookkeeping and should be migrated separately if single-player is moved to the same realtime authority model.
 
 ## 6. Server Architecture
 
@@ -233,31 +234,33 @@ Architecture rule:
 
 ## 8. Match Authority Model
 
-### 8.1 Current Hybrid Model
+### 8.1 Current Online Authority Model
 
 Current online flow:
 
 1. Client creates input command.
-2. Client immediately applies local shot and local physics.
-3. Client creates fast settlement preview.
-4. Client sends command to server.
-5. Server converts command to canonical coordinates and simulates.
-6. Server publishes command to opponent.
-7. Both clients send result acknowledgements back after local animation/calculation.
-8. Server ignores client snapshot/event content for winner and score authority.
-9. Server confirms next turn after both acknowledgements, or ends only by server score, server clock, or acknowledgement timeout.
+2. Client immediately applies local shot for responsive display.
+3. Client sends the command to server.
+4. Server validates session, turn, actor ownership, power limit, and curve limit.
+5. Server converts command to canonical coordinates and applies it to the server-authoritative realtime runtime state.
+6. Server publishes the command for the opponent to fetch through `/online-match/opponent-action`.
+7. Server advances authoritative physics, score, goal celebration pause, turn clock, and match clock in an independent realtime runtime loop.
+8. Client polls `/clock` only for server time and remaining timers.
+9. Client requests `/turn-request` after ready and after movement settles.
+10. `/turn-request` returns only operation permission, current player physics caps, and skill triggers.
+11. Client requests `/score` only after a goal event, and requests `/finish-check` only when score reaches 3 or clock reaches zero.
 
-This keeps responsive local feedback while moving online winner, score, goal records, and match records to server authority.
+The frontend still runs local movement for responsive rendering, but it no longer sends post-action snapshots or goal events for online result validation.
 
 Current HTTP ordering:
 
 1. `/api/online-match/shoot` sends only the input action.
 2. Server validates and publishes the canonical action immediately.
-3. Server computes the authoritative result immediately from that action.
-4. Each client sends `/api/online-match/result` separately after local fast settlement or display settlement.
-5. Server treats those result calls as acknowledgements and confirms both results before allowing the next turn.
-
-Action submission and post-action snapshot are therefore separate HTTP requests, not one request.
+3. `/api/online-match/opponent-action` returns the next localized opponent action to the waiting client.
+4. `/api/online-match/clock` returns only time data.
+5. `/api/online-match/turn-request` returns control permission and physical caps when called by a turn event.
+6. `/api/online-match/score` returns score when called after a goal event.
+7. `/api/online-match/finish-check` returns end permission and settlement data when called after score reaches 3 or clock reaches zero.
 
 ### 8.2 Target Server-Authoritative Model
 
@@ -279,9 +282,9 @@ Target benefit:
 Migration plan:
 
 - Keep `ShootCommand` as input DTO.
-- Replace client `createFastSettlementPreview` result submission with server-generated result packets.
+- Keep server-generated realtime snapshots as the authoritative alignment source.
 - Keep client local physics only as interpolation if it is reconciled to server packets.
-- Remove client-side goal authority from online mode.
+- Continue reducing client-side goal authority from online mode; online score and finish already come from server runtime state.
 
 ## 9. Coordinate And Mirror Architecture
 
@@ -301,13 +304,13 @@ The client includes:
 - `fieldWidth`
 - `fieldHeight`
 
-in online shoot, action poll, clock, and result requests.
+in online shoot, ready, turn-request, and other event-triggered requests that need coordinate scaling.
 
 Server behavior:
 
 - Input command from client is scaled from client field to canonical field.
-- Snapshot from client is scaled from client field to canonical field.
 - Canonical command sent back to a client is scaled from canonical field to target client's last-known field size.
+- `/clock` never carries field size and never performs coordinate work.
 
 ### 9.3 Away Mirror
 
@@ -341,7 +344,8 @@ Online:
 
 - Server owns match duration and turn duration.
 - Client polls `/api/online-match/clock` every 200 ms through `MatchTransport`.
-- Client uses `controlEnabled` from server to decide whether input is allowed.
+- Client uses event-triggered `/api/online-match/turn-request` to unlock input and receive per-turn physics caps.
+- Client uses `/api/online-match/score` for goal-triggered score sync and `/api/online-match/finish-check` for end permission and settlement data.
 
 Architecture rule:
 
@@ -351,17 +355,17 @@ Architecture rule:
 
 Current transport:
 
-- HTTP long polling for actions.
+- HTTP opponent-action polling only while waiting for the opponent's operation.
 - HTTP polling for clock.
 - HTTP post for shoot.
-- HTTP post for result.
+- HTTP post for event-triggered turn permission and player physical caps.
+- HTTP post for goal-triggered score sync.
+- HTTP post for end-triggered finish check and settlement data.
 
 Important state:
 
 - `requestId`: matchmaking identity and per-client match identity.
 - `matchId`: online match id.
-- `sinceSeq`: action polling cursor.
-- `pendingResults`: client-side pending settlement confirmations.
 - `fieldSizesByRequestId`: server-side latest client coordinate size map.
 
 Failure rules:
@@ -370,8 +374,8 @@ Failure rules:
 - If session is invalid, reject.
 - If wrong turn, reject.
 - If prior action is not confirmed, reject.
-- If snapshot/goal validation fails, finish match and mark failing side as loser.
-- If result confirmation times out, finish match against non-responsive side.
+- If a command exceeds server-authorized limits, reject or finish according to anti-cheat policy.
+- If connection state becomes invalid, finish against the disconnected or invalid side according to online match policy.
 
 ## 12. Rewards And Economy Architecture
 
@@ -403,13 +407,13 @@ Architecture rule:
 
 ## 14. Known Technical Debt
 
-1. Online client still computes physics and fast settlement.
-   - Risk: drift and business logic in client.
-   - Target: server result packets.
+1. Single-player still has legacy fast-simulation paths in `SingleMatchService`.
+   - Risk: single-player authority model differs from online.
+   - Target: shared realtime server state machine or explicit offline-only single-player mode.
 
-2. HTTP polling is simple but inefficient for real-time online play.
+2. HTTP opponent-action polling is simple but less efficient than a dedicated realtime channel.
    - Risk: latency and extra server load.
-   - Target: WebSocket or reliable realtime channel after correctness stabilizes.
+   - Target: reliable mobile-compatible realtime channel after correctness stabilizes.
 
 3. Online runtime is in-memory.
    - Risk: server restart loses active matches.

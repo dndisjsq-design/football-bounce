@@ -40,6 +40,7 @@ public final class OnlineMatchDtos {
             Double power,
             Double curveAngleRad,
             Double curveDistance,
+            Boolean noop,
             Double fieldWidth,
             Double fieldHeight,
             Long clientTick,
@@ -49,54 +50,82 @@ public final class OnlineMatchDtos {
     ) {
     }
 
-    public record ActionPollRequest(Long userId, String requestId, String matchId, Long sinceSeq, Double fieldWidth, Double fieldHeight, String deviceId, String authToken, String clientInstanceId) {
+    public record ClockRequest(Long userId, String requestId, String matchId, String deviceId, String authToken, String clientInstanceId) {
     }
 
-    public record ClockRequest(Long userId, String requestId, String matchId, Double fieldWidth, Double fieldHeight, String deviceId, String authToken, String clientInstanceId) {
+    public record ReadyRequest(Long userId, String requestId, String matchId, Double fieldWidth, Double fieldHeight, String deviceId, String authToken, String clientInstanceId) {
+    }
+
+    public record TurnRequest(Long userId, String requestId, String matchId, Double fieldWidth, Double fieldHeight, String deviceId, String authToken, String clientInstanceId) {
+    }
+
+    public record OpponentActionRequest(Long userId, String requestId, String matchId, Long sinceSeq, Double fieldWidth, Double fieldHeight, String deviceId, String authToken, String clientInstanceId) {
+    }
+
+    public record ScoreRequest(Long userId, String requestId, String matchId, String deviceId, String authToken, String clientInstanceId) {
+    }
+
+    public record FinishCheckRequest(Long userId, String requestId, String matchId, String guestSessionId, String deviceId, String authToken, String clientInstanceId) {
     }
 
     public record SettlementRequest(Long userId, String requestId, String matchId, String guestSessionId, String deviceId, String authToken, String clientInstanceId) {
-    }
-
-    public record SubmitResultRequest(
-            Long userId,
-            String requestId,
-            String matchId,
-            String commandId,
-            SnapshotDto snapshot,
-            String eventId,
-            String eventType,
-            Long eventTick,
-            String eventSide,
-            String eventActorId,
-            Integer eventMatchSecond,
-            Boolean eventPenalty,
-            Boolean eventOwnGoal,
-            ScoreDto eventScore,
-            Double fieldWidth,
-            Double fieldHeight,
-            String deviceId,
-            String authToken,
-            String clientInstanceId
-    ) {
     }
 
     public record OnlineClockDto(
             long serverTimeMillis,
             double matchRemainingSeconds,
             double turnRemainingSeconds,
-            String turnNetworkSide,
-            boolean controlEnabled
+            boolean paused,
+            String pauseReason
     ) {
     }
 
     public record ClockResponse(
             boolean ok,
             String message,
+            OnlineClockDto clock
+    ) {
+    }
+
+    public record SkillTriggerDto(
+            String actorId,
+            String skillId,
+            String name
+    ) {
+    }
+
+    public record ReadyResponse(
+            boolean ok,
+            String message,
+            boolean started,
             OnlineClockDto clock,
-            String winnerNetworkSide,
-            String loserNetworkSide,
-            ScoreDto finalScore
+            SnapshotDto snapshot
+    ) {
+    }
+
+    public record TurnResponse(
+            boolean ok,
+            String message,
+            boolean canControl,
+            OnlineClockDto clock,
+            List<PlayerPhysicsSummary> homePhysics,
+            List<PlayerPhysicsSummary> awayPhysics,
+            List<SkillTriggerDto> skillTriggers
+    ) {
+    }
+
+    public record ScoreResponse(
+            boolean ok,
+            String message,
+            ScoreDto score
+    ) {
+    }
+
+    public record FinishCheckResponse(
+            boolean ok,
+            String message,
+            boolean canEnd,
+            SettlementDto settlement
     ) {
     }
 
@@ -109,6 +138,7 @@ public final class OnlineMatchDtos {
             double power,
             Double curveAngleRad,
             Double curveDistance,
+            Boolean noop,
             long clientTick
     ) {
     }
@@ -127,24 +157,7 @@ public final class OnlineMatchDtos {
             String message,
             List<OnlineActionDto> actions,
             long nextSeq,
-            OnlineClockDto clock,
-            String winnerNetworkSide,
-            String loserNetworkSide,
-            ScoreDto finalScore
-    ) {
-    }
-
-    public record ResultResponse(
-            boolean ok,
-            boolean valid,
-            boolean confirmed,
-            String message,
-            OnlineClockDto clock,
-            String winnerNetworkSide,
-            String loserNetworkSide,
-            ScoreDto finalScore,
-            List<PlayerPhysicsSummary> homePhysics,
-            List<PlayerPhysicsSummary> awayPhysics
+            OnlineClockDto clock
     ) {
     }
 

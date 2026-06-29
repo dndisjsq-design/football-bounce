@@ -664,43 +664,40 @@ Request:
 Implementation:
 
 - Server validates session and match membership.
-- Server checks turn and pending confirmation state.
+- Server checks turn, actor ownership, command power limit, and command curve limit.
 - Server converts local command to canonical command.
 - If actor is away, server swaps ids and rotates vectors by 180 degrees.
 - Server normalizes command distance/speed from client field size to canonical field size.
-- Server simulates authoritative expected result.
+- Server applies the command to the authoritative realtime runtime state.
 - Server publishes action for the opponent.
 - Server writes `match_action` with canonical replay command and `match_second`.
 - New online action rows use replay action type `action`.
 
-### 9.5 POST `/api/online-match/actions`
+### 9.5 Opponent Action Poll `/api/online-match/opponent-action`
 
-Request:
+Opponent actions are fetched through HTTP polling after `turn-request` indicates it is not the local player's turn.
 
 ```json
 {
-  "userId": 2,
-  "requestId": "mm-xxx",
-  "matchId": "online-xxx",
-  "sinceSeq": 0,
-  "fieldWidth": 362,
-  "fieldHeight": 650,
-  "deviceId": "string",
-  "authToken": "string",
-  "clientInstanceId": "string"
+  "sinceSeq": 12,
+  "actions": [
+    {
+      "seq": 13,
+      "command": {}
+    }
+  ]
 }
 ```
 
 Implementation:
 
-- Long-polls published action queue.
-- Server updates the request id's last-known field size.
-- Server converts canonical command to target client's local command before returning.
+- Server converts canonical command to target client's local command before returning it.
 - For away target clients, server returns a local-format command that still looks like local home attacking upward.
+- This is the only live-match backend push path.
 
 ### 9.6 POST `/api/online-match/clock`
 
-Request: match/session fields plus field size.
+Request: match/session fields only.
 
 Response:
 
@@ -712,58 +709,48 @@ Response:
     "serverTimeMillis": 0,
     "matchRemainingSeconds": 180,
     "turnRemainingSeconds": 15,
-    "turnNetworkSide": "home",
-    "controlEnabled": true
-  },
-  "winnerNetworkSide": null,
-  "loserNetworkSide": null,
-  "finalScore": null
+    "paused": false,
+    "pauseReason": ""
+  }
 }
 ```
+
+`clock` only returns time. It must not advance physics, return snapshots, unlock input, return score, or return winner fields.
+
+### 9.7 POST `/api/online-match/turn-request`
+
+Event-triggered request for local operation permission, per-turn physical caps, and skill trigger placeholders.
 
 Implementation:
 
 - Server owns online match clock.
-- Client polls every 200 ms through transport.
-- Clock response is localized so the client can treat `home` as self.
+- Server advances authoritative online physics, score, goal celebration pause, and match end through an independent realtime runtime loop.
+- Client calls this endpoint after ready and after local movement settles.
+- Response is localized so the client can treat `home` as self.
+- During goal celebration, `paused=true` and both match time and turn time are fixed.
 
-### 9.7 POST `/api/online-match/result`
+### 9.8 Player Physical Caps
 
-Request:
-
-```json
-{
-  "userId": 2,
-  "requestId": "mm-xxx",
-  "matchId": "online-xxx",
-  "commandId": "shoot-xxx",
-  "snapshot": {},
-  "eventId": "goal-xxx",
-  "eventType": "goal",
-  "eventSide": "home",
-  "eventActorId": "home-1",
-  "eventScore": {"home": 1, "away": 0},
-  "fieldWidth": 362,
-  "fieldHeight": 650,
-  "deviceId": "string",
-  "authToken": "string",
-  "clientInstanceId": "string"
-}
-```
+Physical caps are returned by `/api/online-match/turn-request` when the server unlocks local control.
 
 Implementation:
 
-- Snapshot path: server scales the snapshot into canonical `362x650`, mirrors away snapshots by 180 degrees, and compares score/turn/body states.
-- Goal path: server validates event side and actor against expected server result.
-- Both clients must confirm the same pending action.
-- If validation fails, server finishes match and assigns loss to the failing side.
-- If score reaches 3, server finishes match.
+- Server returns localized `homePhysics` and `awayPhysics`.
+- `/clock` intentionally does not carry physics data, so the 200 ms clock payload stays small.
 
 Current important limitation:
 
-- The client still performs local physics and fast settlement preview. This is not yet a pure server-authoritative presentation-only client. The next architecture step is to remove client settlement authority and have the server return authoritative animation/result packets.
+- The client still performs local physics for responsive rendering. Online score, goal records, clock, and finish are server-owned and aligned through dedicated score, finish-check, and clock requests.
 
-### 9.8 POST `/api/online-match/settlement`
+### 9.9 POST `/api/online-match/score`
+
+Goal-triggered request for authoritative score only. The frontend calls this after a local goal event/goal animation.
+
+### 9.10 POST `/api/online-match/finish-check`
+
+End-triggered request for end permission and settlement data. The frontend calls this when score reaches 3 or clock reaches zero.
+
+### 9.11 POST `/api/online-match/settlement`
 
 Request:
 
@@ -883,9 +870,9 @@ Behavior:
 Current client match behavior:
 
 - `EditableMatch` renders pitch, players, ball, HUD, goal animation, match-end animation, settlement page, and replay.
-- Client still calculates local movement through `step`, `stepFixed`, collision resolution, goal detection, and fast settlement preview.
-- Online transport submits local snapshot/event results for server validation.
-- This is currently a hybrid model: client predicts and server validates.
+- Client still calculates local movement through `step`, `stepFixed`, collision resolution, and goal detection for display responsiveness.
+- Online transport sends shoot commands only, polls opponent-action while waiting for the opponent, polls server clock for time, uses event-triggered turn-request calls for local control and physics caps, uses goal-triggered score calls for score sync, and uses finish-check for end permission and settlement data.
+- Online score, goal records, finish, match clock, and turn clock are server-owned.
 
 Required future target:
 
@@ -955,7 +942,7 @@ Changed:
 - Online match replay persistence now records only start, action, and end rows with match-relative seconds.
 - Single-match replay persistence now excludes goal and kickoff reset events from `match_action`; goals remain in `match_goal_record`.
 - Abnormal online finish no longer fabricates a higher winner score; persisted score uses the actual server score.
-- Online `/api/online-match/result` no longer allows client snapshot or goal-event mismatch to directly decide match winner; it is now an acknowledgement for the server-computed action result.
+- Online clients submit shoot commands, poll server clock for time, poll opponent actions through `/online-match/opponent-action`, fetch turn physics caps through turn-request, query score through `/online-match/score`, and query end permission through `/online-match/finish-check`.
 
 API changes:
 

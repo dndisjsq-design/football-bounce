@@ -1,22 +1,29 @@
 package com.footballbounce.server.service;
 
 import com.footballbounce.server.dto.match.OnlineMatchDtos.CancelRequest;
-import com.footballbounce.server.dto.match.OnlineMatchDtos.ActionPollRequest;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.ActionResponse;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.ClockRequest;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.ClockResponse;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.FinishCheckRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.FinishCheckResponse;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.JoinRequest;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.MatchmakingResponse;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.OnlineActionDto;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.OnlineClockDto;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.OnlinePlayerDto;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.OnlineShootCommandDto;
-import com.footballbounce.server.dto.match.OnlineMatchDtos.ResultResponse;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.OpponentActionRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.ReadyRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.ReadyResponse;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.ScoreRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.ScoreResponse;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.SettlementRequest;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.SettlementResponse;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.SkillTriggerDto;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.StatusRequest;
-import com.footballbounce.server.dto.match.OnlineMatchDtos.SubmitResultRequest;
 import com.footballbounce.server.dto.match.OnlineMatchDtos.SubmitShootRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.TurnRequest;
+import com.footballbounce.server.dto.match.OnlineMatchDtos.TurnResponse;
 import com.footballbounce.server.dto.match.SingleMatchDtos.BestPlayerDto;
 import com.footballbounce.server.dto.match.SingleMatchDtos.BodyDto;
 import com.footballbounce.server.dto.match.SingleMatchDtos.PlayerPhysicsSummary;
@@ -28,6 +35,8 @@ import com.footballbounce.server.dto.match.SingleMatchDtos.SnapshotDto;
 import com.footballbounce.server.domain.UserLoginSession;
 import com.footballbounce.server.repository.SingleMatchMapper;
 import com.footballbounce.server.repository.UserLoginSessionMapper;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -40,6 +49,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -49,9 +61,11 @@ public class OnlineMatchService {
     private static final long WAITING_EXPIRE_MILLIS = 60_000L;
     private static final long MATCH_DURATION_MILLIS = 180_000L;
     private static final long TURN_DURATION_MILLIS = 15_000L;
-    private static final long RESULT_CONFIRM_TIMEOUT_MILLIS = 20_000L;
-    private static final long RESULT_RESPONSE_WAIT_MILLIS = 18_000L;
-    private static final long ACTION_LONG_POLL_MILLIS = 3_500L;
+    private static final long GOAL_CELEBRATION_MILLIS = 3_000L;
+    private static final long READY_WAIT_MILLIS = 10_000L;
+    private static final long TURN_REQUEST_SETTLE_WAIT_MILLIS = GOAL_CELEBRATION_MILLIS + 2_000L;
+    private static final long SERVER_RUNTIME_TICK_MILLIS = 8L;
+    private static final double SERVER_PHYSICS_STEP_SECONDS = 1.0 / 120.0;
     private static final int WIN_SCORE = 3;
     private static final double DEFAULT_FIELD_WIDTH = 362;
     private static final double DEFAULT_FIELD_HEIGHT = 650;
@@ -81,8 +95,6 @@ public class OnlineMatchService {
     private static final double CURVE_MIN_DISTANCE = 34;
     private static final double CORNER_CUSHION_RADIUS = 36;
     private static final double CORNER_CUSHION_RESTITUTION = 0.92;
-    private static final double POSITION_TOLERANCE = 18.0;
-    private static final double VELOCITY_TOLERANCE = 12.0;
 
     private static final Map<String, List<PointRatio>> FORMATIONS = Map.of(
             "balanced-221", ratios(-0.18, -0.34, 0.18, -0.34, -0.16, -0.22, 0.16, -0.22, 0, -0.08),
@@ -98,12 +110,44 @@ public class OnlineMatchService {
     private final MatchRewardService matchRewardService;
     private final Map<String, MatchmakingResponse> statuses = new ConcurrentHashMap<>();
     private final Map<String, OnlineRuntimeMatch> runtimeMatches = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService runtimeExecutor = Executors.newSingleThreadScheduledExecutor(task -> {
+        Thread thread = new Thread(task, "online-match-runtime");
+        thread.setDaemon(true);
+        return thread;
+    });
     private WaitingPlayer waitingPlayer;
 
     public OnlineMatchService(SingleMatchMapper mapper, UserLoginSessionMapper sessionMapper, MatchRewardService matchRewardService) {
         this.mapper = mapper;
         this.sessionMapper = sessionMapper;
         this.matchRewardService = matchRewardService;
+    }
+
+    @PostConstruct
+    public void startRuntimeLoop() {
+        runtimeExecutor.scheduleAtFixedRate(this::advanceOnlineRuntimeLoop, SERVER_RUNTIME_TICK_MILLIS, SERVER_RUNTIME_TICK_MILLIS, TimeUnit.MILLISECONDS);
+    }
+
+    @PreDestroy
+    public void stopRuntimeLoop() {
+        runtimeExecutor.shutdownNow();
+    }
+
+    private void advanceOnlineRuntimeLoop() {
+        long now = System.currentTimeMillis();
+        for (OnlineRuntimeMatch match : runtimeMatches.values()) {
+            try {
+                synchronized (match) {
+                    boolean alreadyPersisted = match.recordPersisted;
+                    match.advanceRuntime(now);
+                    if (match.finished && !alreadyPersisted) {
+                        persistFinishedMatch(match, now);
+                    }
+                }
+            } catch (Exception ignored) {
+                // Keep the runtime loop alive; request paths still return concrete errors.
+            }
+        }
     }
 
     @Transactional
@@ -170,157 +214,86 @@ public class OnlineMatchService {
                 Math.max(0, request.power() == null ? 0 : request.power()),
                 request.curveAngleRad(),
                 request.curveDistance(),
+                request.noop() == Boolean.TRUE,
                 request.clientTick() == null ? System.currentTimeMillis() : request.clientTick()
         );
         synchronized (match) {
             long now = System.currentTimeMillis();
-            match.advanceExpiredTurn(now);
+            match.advanceRuntime(now);
             String networkSide = match.networkSide(userId, requestId);
             match.updateFieldSize(requestId, clientFieldSize);
             if (match.finished) {
                 persistFinishedMatch(match, now);
-                return match.finishedActionResponse(now, networkSide);
+                return new ActionResponse(false, "比赛已结束", List.of(), match.lastPublishedSeq, match.clock(now));
+            }
+            if (!match.started) {
+                return new ActionResponse(false, "比赛尚未开始", List.of(), match.lastPublishedSeq, match.clock(now));
             }
             if (!networkSide.equals(match.turnNetworkSide)) {
-                return new ActionResponse(false, "还没有轮到当前玩家", List.of(), match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+                return new ActionResponse(false, "还没有轮到当前玩家", List.of(), match.lastPublishedSeq, match.clock(now));
             }
-            if (match.awaitingConfirmation()) {
-                return new ActionResponse(false, "上一拍尚未完成服务端核验", List.of(), match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+            if (!match.controlEnabled()) {
+                return new ActionResponse(false, "当前回合尚未解锁", List.of(), match.lastPublishedSeq, match.clock(now));
             }
-            if (match.pendingByCommandId.containsKey(command.commandId())) {
-                return new ActionResponse(true, "操作已登记", List.of(), match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+            if (match.publishedByCommandId.containsKey(command.commandId())) {
+                return new ActionResponse(true, "操作已登记", List.of(), match.lastPublishedSeq, match.clock(now));
             }
             OnlineShootCommandDto serverCommand = canonicalCommand(command, networkSide, matchId, clientFieldSize);
-            ScoreDto scoreBefore = match.serverState.score();
-            SnapshotDto serverSnapshot = match.serverState.applyCommandAndSimulate(serverCommand);
-            if (serverSnapshot == null) {
-                return new ActionResponse(false, "服务端拒绝本次操作", List.of(), match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+            String commandError = match.serverState.commandLimitError(serverCommand);
+            if (!commandError.isBlank()) {
+                return new ActionResponse(false, commandError, List.of(), match.lastPublishedSeq, match.clock(now));
             }
-            OnlineActionState action = new OnlineActionState(userId, requestId, networkSide, serverCommand, scoreBefore, serverSnapshot, now);
+            if (!match.serverState.applyCommand(serverCommand)) {
+                return new ActionResponse(false, "服务端拒绝本次操作", List.of(), match.lastPublishedSeq, match.clock(now));
+            }
+            OnlineActionState action = new OnlineActionState(userId, requestId, networkSide, serverCommand, now);
             action.seq = ++match.lastPublishedSeq;
-            action.published = true;
-            action.publishedAtMillis = now;
-            match.pendingByCommandId.put(command.commandId(), action);
             match.publishedActions.add(action);
             match.publishedByCommandId.put(command.commandId(), action);
-            match.turnNetworkSide = match.opponentSide(action.actorNetworkSide);
+            match.latestAction = action;
+            match.turnNetworkSide = match.serverState.turn;
+            match.turnElapsedMillis = 0;
+            match.physicsStepAccumulatorSeconds = 0;
             mapper.insertAction(matchId, match.nextActionIndex(), userId, networkSide, serverCommand.actorId(), "action", match.matchSecond(now), commandJson(serverCommand), null, "pending");
             match.notifyAll();
-            return new ActionResponse(true, "操作已登记并广播，等待双方结算确认", List.of(), match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+            return new ActionResponse(true, "操作已登记", List.of(), match.lastPublishedSeq, match.clock(now));
         }
     }
 
-    public ResultResponse submitResult(SubmitResultRequest request) {
-        if (request == null) return resultError("结算参数为空");
-        long userId = normalizeUserId(request.userId());
-        String requestId = safeText(request.requestId());
-        String matchId = safeText(request.matchId());
-        String commandId = safeText(request.commandId());
+    public ActionResponse pollOpponentAction(OpponentActionRequest request) {
+        long userId = normalizeUserId(request == null ? null : request.userId());
+        String requestId = safeText(request == null ? "" : request.requestId());
+        String matchId = safeText(request == null ? "" : request.matchId());
         OnlineRuntimeMatch match = runtimeMatches.get(matchId);
-        if (match == null) return resultError("比赛不存在或已过期");
-        String authError = validateActionSession(userId, request.deviceId(), request.authToken(), request.clientInstanceId());
-        if (authError != null) return resultError(authError);
-        if (!match.hasPlayer(userId, requestId)) return resultError("用户不属于本场比赛");
-        FieldSize clientFieldSize = fieldSizeFromResult(request);
+        if (match == null) return actionError("比赛不存在或已过期");
+        String authError = validateActionSession(userId, request == null ? "" : request.deviceId(), request == null ? "" : request.authToken(), request == null ? "" : request.clientInstanceId());
+        if (authError != null) return actionError(authError);
+        if (!match.hasPlayer(userId, requestId)) return actionError("用户不属于本场比赛");
+        FieldSize clientFieldSize = fieldSize(request == null ? null : request.fieldWidth(), request == null ? null : request.fieldHeight());
         synchronized (match) {
             long now = System.currentTimeMillis();
-            match.advanceExpiredTurn(now);
+            match.advanceRuntime(now);
             String networkSide = match.networkSide(userId, requestId);
             match.updateFieldSize(requestId, clientFieldSize);
-            if (match.finished) {
-                persistFinishedMatch(match, now);
-                return match.finishedResultResponse(now, networkSide);
-            }
-            OnlineActionState action = match.pendingByCommandId.get(commandId);
-            if (action == null) {
-                action = match.publishedByCommandId.get(commandId);
-            }
-            if (action == null) return resultError("操作不存在或已过期");
-            if (!action.expectedGoalSide().isBlank()) {
-                return handleGoalResult(request, userId, requestId, matchId, match, now, networkSide, action);
-            }
-            action.confirmedRequestIds.add(requestId);
-            boolean confirmed = match.actionFullyConfirmed(action);
-            if (confirmed && !action.confirmed) {
-                action.confirmed = true;
-                match.pendingByCommandId.remove(commandId);
-                match.turnStartedAtMillis = now;
-                match.notifyAll();
-            }
-            if (!confirmed) {
-                waitForResultConfirmation(match, action, now + RESULT_RESPONSE_WAIT_MILLIS);
-                now = System.currentTimeMillis();
-                if (match.finished) {
-                    persistFinishedMatch(match, now);
-                    return match.finishedResultResponse(now, networkSide);
-                }
-                confirmed = action.confirmed;
-            }
-            return new ResultResponse(
-                    true,
-                    true,
-                    confirmed,
-                    confirmed ? "双方结算已确认，下一回合已解锁" : "本端结算已确认，等待对方确认",
-                    match.clock(now, networkSide),
-                    null,
-                    null,
-                    null,
-                    confirmed ? match.localPhysics("home", networkSide) : List.of(),
-                    confirmed ? match.localPhysics("away", networkSide) : List.of()
-            );
-        }
-    }
-
-    private ResultResponse handleGoalResult(SubmitResultRequest request, long userId, String requestId, String matchId, OnlineRuntimeMatch match, long now, String networkSide, OnlineActionState action) {
-        String expectedGoalSide = action.expectedGoalSide();
-        action.confirmedRequestIds.add(requestId);
-        boolean confirmed = match.actionFullyConfirmed(action);
-        boolean shouldPersistFinish = false;
-        if (confirmed && !action.confirmed) {
-            action.confirmed = true;
-            match.pendingByCommandId.remove(request.commandId());
-            recordOnlineGoal(match, action, expectedGoalSide);
-            match.turnNetworkSide = match.opponentSide(expectedGoalSide);
-            match.serverState.turn = match.turnNetworkSide;
-            match.serverState.resetObjects(match.turnNetworkSide);
-            match.turnStartedAtMillis = now;
-            if (match.serverState.score().home() >= WIN_SCORE || match.serverState.score().away() >= WIN_SCORE) {
-                match.finishWithWinner(expectedGoalSide, "比赛结束");
-                shouldPersistFinish = true;
-            }
-        }
-        if (confirmed) match.notifyAll();
-        if (!confirmed) {
-            waitForResultConfirmation(match, action, now + RESULT_RESPONSE_WAIT_MILLIS);
-            now = System.currentTimeMillis();
-            confirmed = action.confirmed;
-            shouldPersistFinish = match.finished;
-        }
-        if (shouldPersistFinish) persistFinishedMatch(match, now);
-        return new ResultResponse(
-                true,
-                true,
-                confirmed,
-                confirmed ? "进球已确认，下一回合已解锁" : "进球已确认，等待对方结果",
-                match.clock(now, networkSide),
-                match.localWinnerSide(networkSide),
-                match.localLoserSide(networkSide),
-                match.localFinishScore(networkSide),
-                confirmed && !match.finished ? match.localPhysics("home", networkSide) : List.of(),
-                confirmed && !match.finished ? match.localPhysics("away", networkSide) : List.of()
-        );
-    }
-
-    private void waitForResultConfirmation(OnlineRuntimeMatch match, OnlineActionState action, long deadlineMillis) {
-        while (!match.finished && !action.confirmed) {
-            long remaining = deadlineMillis - System.currentTimeMillis();
-            if (remaining <= 0) return;
-            try {
-                match.wait(remaining);
-            } catch (InterruptedException ex) {
-                Thread.currentThread().interrupt();
-                return;
-            }
+            long sinceSeq = Math.max(0, request == null || request.sinceSeq() == null ? 0 : request.sinceSeq());
+            List<OnlineActionDto> actions = match.publishedActions
+                    .stream()
+                    .filter(action -> action.seq > sinceSeq)
+                    .filter(action -> !networkSide.equals(action.actorNetworkSide))
+                    .map(action -> new OnlineActionDto(
+                            action.seq,
+                            action.actorUserId,
+                            action.actorRequestId,
+                            action.actorNetworkSide,
+                            localCommand(action.command, networkSide, match.fieldSizeForRequestId(requestId))
+                    ))
+                    .limit(1)
+                    .toList();
+            long nextSeq = actions.isEmpty()
+                    ? Math.max(sinceSeq, match.lastPublishedSeq)
+                    : actions.get(actions.size() - 1).seq();
+            String message = actions.isEmpty() ? "等待对手操作" : "收到对手操作";
+            return new ActionResponse(true, message, actions, nextSeq, match.clock(now));
         }
     }
 
@@ -337,21 +310,38 @@ public class OnlineMatchService {
         mapper.insertGoal(match.matchId, match.nextGoalOrder(), matchSecond, scorerUserId, scorerUsername, goalSide, actorId, playerId, playerName, false, ownGoal);
     }
 
-    public ActionResponse pollActions(ActionPollRequest request) {
+    public ClockResponse clock(ClockRequest request) {
         long userId = normalizeUserId(request == null ? null : request.userId());
         String requestId = safeText(request == null ? "" : request.requestId());
         String matchId = safeText(request == null ? "" : request.matchId());
         OnlineRuntimeMatch match = runtimeMatches.get(matchId);
-        if (match == null) return actionError("比赛不存在或已过期");
+        if (match == null) return new ClockResponse(false, "比赛不存在或已过期", null);
         String authError = validateActionSession(userId, request == null ? "" : request.deviceId(), request == null ? "" : request.authToken(), request == null ? "" : request.clientInstanceId());
-        if (authError != null) return actionError(authError);
-        if (!match.hasPlayer(userId, requestId)) return actionError("用户不属于本场比赛");
-        long sinceSeq = request == null || request.sinceSeq() == null ? 0 : Math.max(0, request.sinceSeq());
+        if (authError != null) return new ClockResponse(false, authError, null);
+        if (!match.hasPlayer(userId, requestId)) return new ClockResponse(false, "用户不属于本场比赛", null);
+        synchronized (match) {
+            long now = System.currentTimeMillis();
+            return new ClockResponse(true, "ok", match.clock(now));
+        }
+    }
+
+    public ReadyResponse ready(ReadyRequest request) {
+        long userId = normalizeUserId(request == null ? null : request.userId());
+        String requestId = safeText(request == null ? "" : request.requestId());
+        String matchId = safeText(request == null ? "" : request.matchId());
+        OnlineRuntimeMatch match = runtimeMatches.get(matchId);
+        if (match == null) return new ReadyResponse(false, "比赛不存在或已过期", false, null, null);
+        String authError = validateActionSession(userId, request == null ? "" : request.deviceId(), request == null ? "" : request.authToken(), request == null ? "" : request.clientInstanceId());
+        if (authError != null) return new ReadyResponse(false, authError, false, null, null);
+        if (!match.hasPlayer(userId, requestId)) return new ReadyResponse(false, "用户不属于本场比赛", false, null, null);
         FieldSize clientFieldSize = fieldSize(request == null ? null : request.fieldWidth(), request == null ? null : request.fieldHeight());
         synchronized (match) {
+            long now = System.currentTimeMillis();
+            String networkSide = match.networkSide(userId, requestId);
             match.updateFieldSize(requestId, clientFieldSize);
-            long deadline = System.currentTimeMillis() + ACTION_LONG_POLL_MILLIS;
-            while (!match.finished && match.lastPublishedSeq <= sinceSeq) {
+            match.markReady(requestId, now);
+            long deadline = now + READY_WAIT_MILLIS;
+            while (!match.started && !match.finished) {
                 long remaining = deadline - System.currentTimeMillis();
                 if (remaining <= 0) break;
                 try {
@@ -361,51 +351,124 @@ public class OnlineMatchService {
                     break;
                 }
             }
-            long now = System.currentTimeMillis();
-            match.advanceExpiredTurn(now);
-            match.expireResultTimeouts(now);
-            String networkSide = match.networkSide(userId, requestId);
+            now = System.currentTimeMillis();
             if (match.finished) {
                 persistFinishedMatch(match, now);
-                return match.finishedActionResponse(now, networkSide);
+                return new ReadyResponse(false, match.finishMessage, false, match.clock(now), match.localSnapshot(networkSide));
             }
-            List<OnlineActionDto> actions = match.publishedActions.stream()
-                    .filter(action -> action.seq > sinceSeq)
-                    .map(action -> new OnlineActionDto(
-                            action.seq,
-                            action.actorUserId,
-                            action.actorRequestId,
-                            action.actorNetworkSide,
-                            localCommand(action.command, networkSide, match.fieldSizeForRequestId(requestId))
-                    ))
-                    .toList();
-            return new ActionResponse(true, "ok", actions, match.lastPublishedSeq, match.clock(now, networkSide), null, null, null);
+            if (!match.started) {
+                return new ReadyResponse(true, "等待对手场景加载", false, match.clock(now), match.localSnapshot(networkSide));
+            }
+            return new ReadyResponse(true, "比赛已开始", true, match.clock(now), match.localSnapshot(networkSide));
         }
     }
 
-    public ClockResponse clock(ClockRequest request) {
+    public TurnResponse turnRequest(TurnRequest request) {
         long userId = normalizeUserId(request == null ? null : request.userId());
         String requestId = safeText(request == null ? "" : request.requestId());
         String matchId = safeText(request == null ? "" : request.matchId());
         OnlineRuntimeMatch match = runtimeMatches.get(matchId);
-        if (match == null) return new ClockResponse(false, "比赛不存在或已过期", null, null, null, null);
+        if (match == null) return turnError("比赛不存在或已过期");
         String authError = validateActionSession(userId, request == null ? "" : request.deviceId(), request == null ? "" : request.authToken(), request == null ? "" : request.clientInstanceId());
-        if (authError != null) return new ClockResponse(false, authError, null, null, null, null);
-        if (!match.hasPlayer(userId, requestId)) return new ClockResponse(false, "用户不属于本场比赛", null, null, null, null);
+        if (authError != null) return turnError(authError);
+        if (!match.hasPlayer(userId, requestId)) return turnError("用户不属于本场比赛");
         FieldSize clientFieldSize = fieldSize(request == null ? null : request.fieldWidth(), request == null ? null : request.fieldHeight());
         synchronized (match) {
             long now = System.currentTimeMillis();
-            match.advanceExpiredTurn(now);
-            match.expireResultTimeouts(now);
+            match.advanceRuntime(now);
             String networkSide = match.networkSide(userId, requestId);
             match.updateFieldSize(requestId, clientFieldSize);
             if (match.finished) {
                 persistFinishedMatch(match, now);
-                return new ClockResponse(false, match.finishMessage, match.clock(now, networkSide), match.localWinnerSide(networkSide), match.localLoserSide(networkSide), match.localFinishScore(networkSide));
+                return new TurnResponse(false, "比赛已结束", false, match.clock(now), List.of(), List.of(), List.of());
             }
-            OnlineClockDto clock = match.clock(now, networkSide);
-            return new ClockResponse(true, "ok", clock, null, null, null);
+            if (!match.started) {
+                return new TurnResponse(true, "等待双方开始比赛", false, match.clock(now), List.of(), List.of(), List.of());
+            }
+            if (!networkSide.equals(match.turnNetworkSide)) {
+                return new TurnResponse(true, "不是你的回合", false, match.clock(now), List.of(), List.of(), List.of());
+            }
+            if (!match.controlEnabled()) {
+                long deadline = now + TURN_REQUEST_SETTLE_WAIT_MILLIS;
+                while (!match.finished && match.started && networkSide.equals(match.turnNetworkSide) && !match.controlEnabled()) {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0) break;
+                    try {
+                        match.wait(remaining);
+                    } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                now = System.currentTimeMillis();
+                match.advanceRuntime(now);
+                if (match.finished) {
+                    persistFinishedMatch(match, now);
+                    return new TurnResponse(false, "比赛已结束", false, match.clock(now), List.of(), List.of(), List.of());
+                }
+                if (!networkSide.equals(match.turnNetworkSide)) {
+                    return new TurnResponse(true, "不是你的回合", false, match.clock(now), List.of(), List.of(), List.of());
+                }
+                if (!match.controlEnabled()) {
+                    return new TurnResponse(true, "等待场上静止", false, match.clock(now), List.of(), List.of(), List.of());
+                }
+            }
+            return new TurnResponse(
+                    true,
+                    "允许操作",
+                    true,
+                    match.clock(now),
+                    match.localPhysics("home", networkSide),
+                    match.localPhysics("away", networkSide),
+                    List.<SkillTriggerDto>of()
+            );
         }
+    }
+
+    public ScoreResponse score(ScoreRequest request) {
+        long userId = normalizeUserId(request == null ? null : request.userId());
+        String requestId = safeText(request == null ? "" : request.requestId());
+        String matchId = safeText(request == null ? "" : request.matchId());
+        OnlineRuntimeMatch match = runtimeMatches.get(matchId);
+        if (match == null) return new ScoreResponse(false, "比赛不存在或已过期", null);
+        String authError = validateActionSession(userId, request == null ? "" : request.deviceId(), request == null ? "" : request.authToken(), request == null ? "" : request.clientInstanceId());
+        if (authError != null) return new ScoreResponse(false, authError, null);
+        if (!match.hasPlayer(userId, requestId)) return new ScoreResponse(false, "用户不属于本场比赛", null);
+        synchronized (match) {
+            long now = System.currentTimeMillis();
+            match.advanceRuntime(now);
+            String networkSide = match.networkSide(userId, requestId);
+            if (match.finished) persistFinishedMatch(match, now);
+            return new ScoreResponse(true, "查询成功", match.localCurrentScore(networkSide));
+        }
+    }
+
+    public FinishCheckResponse finishCheck(FinishCheckRequest request) {
+        if (request == null) return finishCheckError("结束校验参数为空");
+        long userId = normalizeUserId(request.userId());
+        String requestId = safeText(request.requestId());
+        String matchId = safeText(request.matchId());
+        if (matchId.isBlank()) return finishCheckError("比赛编号为空");
+        String authError = validateActionSession(userId, request.deviceId(), request.authToken(), request.clientInstanceId());
+        if (authError != null) return finishCheckError(authError);
+        OnlineRuntimeMatch match = runtimeMatches.get(matchId);
+        if (match == null) return finishCheckError("比赛不存在或已过期");
+        synchronized (match) {
+            if (!match.hasPlayer(userId, requestId)) {
+                return finishCheckError("用户不属于本场比赛");
+            }
+            long now = System.currentTimeMillis();
+            match.advanceRuntime(now);
+            if (!match.finished) {
+                return new FinishCheckResponse(true, "比赛尚未结束", false, null);
+            }
+            persistFinishedMatch(match, now);
+        }
+        SettlementResponse settlement = buildOnlineSettlement(userId, matchId, safeText(request.guestSessionId()));
+        if (!settlement.ok() || settlement.settlement() == null) {
+            return finishCheckError(settlement.message());
+        }
+        return new FinishCheckResponse(true, "允许结束", true, settlement.settlement());
     }
 
     public SettlementResponse settlement(SettlementRequest request) {
@@ -427,8 +490,11 @@ public class OnlineMatchService {
                 }
             }
         }
+        return buildOnlineSettlement(userId, matchId, safeText(request.guestSessionId()));
+    }
+
+    private SettlementResponse buildOnlineSettlement(long userId, String matchId, String guestSessionId) {
         boolean guestOnly = userId == GUEST_USER_ID;
-        String guestSessionId = safeText(request.guestSessionId());
         if (guestOnly && guestSessionId.isBlank()) {
             return settlementError("游客会话已失效");
         }
@@ -486,7 +552,7 @@ public class OnlineMatchService {
         if (match == null || !match.finished || match.recordPersisted) return;
         match.recordPersisted = true;
         ScoreDto score = match.serverState.score();
-        int duration = (int) Math.max(0, Math.min(MATCH_DURATION_MILLIS, now - match.startedAtMillis) / 1000);
+        int duration = (int) Math.max(0, Math.min(MATCH_DURATION_MILLIS, match.matchElapsedMillis) / 1000);
         boolean homeWin = "home".equals(match.winnerNetworkSide);
         boolean awayWin = "away".equals(match.winnerNetworkSide);
         mapper.finishMatch(match.matchId, match.homeUserId, duration, score.home() + " : " + score.away(), homeWin ? "win" : "lose");
@@ -679,11 +745,15 @@ public class OnlineMatchService {
     }
 
     private ActionResponse actionError(String message) {
-        return new ActionResponse(false, message, List.of(), 0, null, null, null, null);
+        return new ActionResponse(false, message, List.of(), 0, null);
     }
 
-    private ResultResponse resultError(String message) {
-        return new ResultResponse(false, false, false, message, null, null, null, null, List.of(), List.of());
+    private TurnResponse turnError(String message) {
+        return new TurnResponse(false, message, false, null, List.of(), List.of(), List.of());
+    }
+
+    private FinishCheckResponse finishCheckError(String message) {
+        return new FinishCheckResponse(false, message, false, null);
     }
 
     private SettlementResponse settlementError(String message) {
@@ -822,13 +892,6 @@ public class OnlineMatchService {
         return new FieldSize(positiveOrDefault(width, DEFAULT_FIELD_WIDTH), positiveOrDefault(height, DEFAULT_FIELD_HEIGHT));
     }
 
-    private static FieldSize fieldSizeFromResult(SubmitResultRequest request) {
-        SnapshotDto snapshot = request == null ? null : request.snapshot();
-        Double width = snapshot == null || snapshot.fieldWidth() == null ? (request == null ? null : request.fieldWidth()) : snapshot.fieldWidth();
-        Double height = snapshot == null || snapshot.fieldHeight() == null ? (request == null ? null : request.fieldHeight()) : snapshot.fieldHeight();
-        return fieldSize(width, height);
-    }
-
     private static FieldSize canonicalFieldSize() {
         return new FieldSize(DEFAULT_FIELD_WIDTH, DEFAULT_FIELD_HEIGHT);
     }
@@ -909,6 +972,20 @@ public class OnlineMatchService {
     }
 
     private static OnlineShootCommandDto canonicalCommand(OnlineShootCommandDto command, String networkSide, String matchId, FieldSize sourceFieldSize) {
+        if (command.noop() == Boolean.TRUE) {
+            return new OnlineShootCommandDto(
+                    command.commandId(),
+                    matchId,
+                    "",
+                    "away".equals(networkSide) ? "away" : "home",
+                    0,
+                    0,
+                    0.0,
+                    0.0,
+                    true,
+                    command.clientTick()
+            );
+        }
         double localAngle = normalizeAngle(command.angleRad());
         double canonicalAngle = angleBetweenFields(localAngle, sourceFieldSize, canonicalFieldSize(), "away".equals(networkSide));
         double distanceScale = distanceScaleForAngle(localAngle, sourceFieldSize, canonicalFieldSize());
@@ -924,6 +1001,7 @@ public class OnlineMatchService {
                     canonicalPower,
                     command.curveAngleRad(),
                     canonicalCurveDistance,
+                    command.noop(),
                     command.clientTick()
             );
         }
@@ -936,12 +1014,27 @@ public class OnlineMatchService {
                 canonicalPower,
                 command.curveAngleRad(),
                 canonicalCurveDistance,
+                command.noop(),
                 command.clientTick()
         );
     }
 
     private static OnlineShootCommandDto localCommand(OnlineShootCommandDto canonical, String targetNetworkSide, FieldSize targetFieldSize) {
         if (canonical == null) return null;
+        if (canonical.noop() == Boolean.TRUE) {
+            return new OnlineShootCommandDto(
+                    canonical.commandId(),
+                    canonical.matchId(),
+                    "",
+                    localSide(canonical.side(), targetNetworkSide),
+                    0,
+                    0,
+                    0.0,
+                    0.0,
+                    true,
+                    canonical.clientTick()
+            );
+        }
         double orientedCanonicalAngle = "away".equals(targetNetworkSide)
                 ? rotateHalfTurnAngle(canonical.angleRad())
                 : normalizeAngle(canonical.angleRad());
@@ -961,6 +1054,7 @@ public class OnlineMatchService {
                     localPower,
                     canonical.curveAngleRad(),
                     localCurveDistance,
+                    canonical.noop(),
                     canonical.clientTick()
             );
         }
@@ -973,6 +1067,7 @@ public class OnlineMatchService {
                 localPower,
                 canonical.curveAngleRad(),
                 localCurveDistance,
+                canonical.noop(),
                 canonical.clientTick()
         );
     }
@@ -1059,49 +1154,6 @@ public class OnlineMatchService {
         return value;
     }
 
-    private static String compareSnapshots(SnapshotDto expected, SnapshotDto actual) {
-        if (expected == null || actual == null) return "结算快照为空";
-        if (expected.score() != null && actual.score() != null) {
-            if (expected.score().home() != actual.score().home() || expected.score().away() != actual.score().away()) {
-                return "比分校验不一致 expected=" + expected.score().home() + ":" + expected.score().away()
-                        + " actual=" + actual.score().home() + ":" + actual.score().away();
-            }
-        }
-        if (!safeTextStatic(expected.turn()).equals(safeTextStatic(actual.turn()))) {
-            return "回合校验不一致 expected=" + safeTextStatic(expected.turn()) + " actual=" + safeTextStatic(actual.turn());
-        }
-        String ballMismatch = compareBody("足球", expected.ball(), actual.ball());
-        if (!ballMismatch.isBlank()) return ballMismatch;
-        Map<String, BodyDto> actualPlayers = new HashMap<>();
-        if (actual.players() != null) {
-            for (BodyDto body : actual.players()) {
-                if (body != null) actualPlayers.put(safeTextStatic(body.id()), body);
-            }
-        }
-        if (expected.players() != null) {
-            for (BodyDto expectedPlayer : expected.players()) {
-                if (expectedPlayer == null) continue;
-                BodyDto actualPlayer = actualPlayers.get(safeTextStatic(expectedPlayer.id()));
-                String mismatch = compareBody("球员" + expectedPlayer.id(), expectedPlayer, actualPlayer);
-                if (!mismatch.isBlank()) return mismatch;
-            }
-        }
-        return "";
-    }
-
-    private static String compareBody(String label, BodyDto expected, BodyDto actual) {
-        if (expected == null || actual == null) return label + "缺失";
-        if (Math.abs(expected.x() - actual.x()) > POSITION_TOLERANCE || Math.abs(expected.y() - actual.y()) > POSITION_TOLERANCE) {
-            return label + "位置校验不一致 dx=" + round(actual.x() - expected.x()) + " dy=" + round(actual.y() - expected.y())
-                    + " expected=(" + expected.x() + "," + expected.y() + ") actual=(" + actual.x() + "," + actual.y() + ")";
-        }
-        if (Math.abs(expected.vx() - actual.vx()) > VELOCITY_TOLERANCE || Math.abs(expected.vy() - actual.vy()) > VELOCITY_TOLERANCE) {
-            return label + "速度校验不一致 dvx=" + round(actual.vx() - expected.vx()) + " dvy=" + round(actual.vy() - expected.vy())
-                    + " expected=(" + expected.vx() + "," + expected.vy() + ") actual=(" + actual.vx() + "," + actual.vy() + ")";
-        }
-        return "";
-    }
-
     private static String commandJson(OnlineShootCommandDto command) {
         if (command == null) return "{}";
         return "{"
@@ -1113,6 +1165,7 @@ public class OnlineMatchService {
                 + "\"power\":" + command.power() + ","
                 + "\"curveAngleRad\":" + (command.curveAngleRad() == null ? 0 : command.curveAngleRad()) + ","
                 + "\"curveDistance\":" + (command.curveDistance() == null ? 0 : command.curveDistance()) + ","
+                + "\"noop\":" + (command.noop() == Boolean.TRUE) + ","
                 + "\"clientTick\":" + command.clientTick()
                 + "}";
     }
@@ -1443,14 +1496,6 @@ public class OnlineMatchService {
             resolveAllCollisions();
         }
 
-        private SnapshotDto applyCommandAndSimulate(OnlineShootCommandDto command) {
-            if (!applyCommand(command)) {
-                return null;
-            }
-            simulateUntilSettled();
-            return snapshot();
-        }
-
         private PlayerSummary playerForActor(String actorId) {
             int slot = slotIndex(actorId);
             if (slot < 0) return null;
@@ -1469,6 +1514,14 @@ public class OnlineMatchService {
         }
 
         private boolean applyCommand(OnlineShootCommandDto command) {
+            if (command.noop() == Boolean.TRUE) {
+                if (!command.side().equals(turn) || !isSettled()) {
+                    return false;
+                }
+                turn = "home".equals(turn) ? "away" : "home";
+                goalLocked = false;
+                return true;
+            }
             Body actor = findBody(command.actorId());
             if (actor == null || !actor.side.equals(command.side()) || !command.side().equals(turn) || !isSettled()) {
                 return false;
@@ -1490,16 +1543,34 @@ public class OnlineMatchService {
             return true;
         }
 
-        private void simulateUntilSettled() {
-            int maxSteps = 120 * 18;
-            double dt = 1.0 / 120.0;
-            for (int i = 0; i < maxSteps; i += 1) {
-                step(dt);
-                tick += 1;
-                if (i > 12 && isSettled()) {
-                    break;
-                }
+        private String commandLimitError(OnlineShootCommandDto command) {
+            if (command == null) return "操作为空";
+            if (command.noop() == Boolean.TRUE) {
+                if (!command.side().equals(turn)) return "当前不是该方回合";
+                if (!isSettled()) return "场上物体尚未完全停止";
+                return "";
             }
+            Body actor = findBody(command.actorId());
+            if (actor == null) return "操作球员不存在";
+            if (!actor.side.equals(command.side())) return "操作球员归属错误";
+            if (!command.side().equals(turn)) return "当前不是该方回合";
+            if (!isSettled()) return "场上物体尚未完全停止";
+            double maxPower = powerScaleForActor(actor.id);
+            if (command.power() < -0.001 || command.power() > maxPower + 0.001) {
+                return "力度超过球员上限";
+            }
+            double maxCurveAngle = maxCurveAngleForActor(actor.id);
+            double curveAngle = command.curveAngleRad() == null ? 0 : command.curveAngleRad();
+            if (Math.abs(curveAngle) > maxCurveAngle + 0.001) {
+                return "弧度超过球员上限";
+            }
+            if (command.curveDistance() != null && command.curveDistance() < -0.001) {
+                return "弧线距离无效";
+            }
+            if (!Double.isFinite(command.angleRad()) || !Double.isFinite(command.power())) {
+                return "操作参数非法";
+            }
+            return "";
         }
 
         private void step(double dt) {
@@ -1729,11 +1800,6 @@ public class OnlineMatchService {
             return new ScoreDto(scoreHome, scoreAway);
         }
 
-        private void setScore(int home, int away) {
-            scoreHome = Math.max(0, home);
-            scoreAway = Math.max(0, away);
-        }
-
         private boolean isSettled() {
             for (Body body : bodies()) {
                 if (Math.abs(body.vx) + Math.abs(body.vy) >= 1) return false;
@@ -1802,7 +1868,7 @@ public class OnlineMatchService {
     private record FieldSize(double width, double height) {
     }
 
-    private static final class OnlineRuntimeMatch {
+    private final class OnlineRuntimeMatch {
         private final String matchId;
         private final Long homeUserId;
         private final String homeRequestId;
@@ -1816,20 +1882,30 @@ public class OnlineMatchService {
         private final List<PlayerSummary> awayLineup;
         private final long startedAtMillis;
         private final OnlineServerState serverState;
-        private final Map<String, OnlineActionState> pendingByCommandId = new HashMap<>();
         private final Map<String, OnlineActionState> publishedByCommandId = new HashMap<>();
         private final Map<String, FieldSize> fieldSizesByRequestId = new HashMap<>();
+        private final Set<String> readyRequestIds = new HashSet<>();
         private final List<OnlineActionState> publishedActions = new ArrayList<>();
         private long lastPublishedSeq = 0;
         private int nextActionIndex = 1;
         private int nextGoalOrder = 1;
         private String turnNetworkSide = "home";
-        private long turnStartedAtMillis;
+        private long lastAdvancedAtMillis;
+        private long matchElapsedMillis;
+        private long turnElapsedMillis;
+        private long celebrationUntilMillis;
+        private double physicsStepAccumulatorSeconds;
+        private String pauseReason = "";
+        private boolean started;
+        private int recordedScoreHome;
+        private int recordedScoreAway;
+        private String pendingWinnerAfterCelebration;
         private boolean finished;
         private String winnerNetworkSide;
         private String loserNetworkSide;
         private String finishMessage;
         private boolean recordPersisted;
+        private OnlineActionState latestAction;
 
         private OnlineRuntimeMatch(
                 String matchId,
@@ -1857,7 +1933,7 @@ public class OnlineMatchService {
             this.awayFormationId = awayFormationId == null || awayFormationId.isBlank() ? "balanced-221" : awayFormationId;
             this.awayLineup = awayLineup == null ? List.of() : List.copyOf(awayLineup);
             this.startedAtMillis = startedAtMillis;
-            this.turnStartedAtMillis = startedAtMillis;
+            this.lastAdvancedAtMillis = startedAtMillis;
             this.serverState = new OnlineServerState(matchId, this.homeFormationId, this.awayFormationId, this.homeLineup, this.awayLineup, DEFAULT_FIELD_WIDTH, DEFAULT_FIELD_HEIGHT);
             this.serverState.resetObjects("home");
             this.fieldSizesByRequestId.put(homeRequestId, canonicalFieldSize());
@@ -1883,43 +1959,169 @@ public class OnlineMatchService {
             fieldSizesByRequestId.put(key, size);
         }
 
+        private String requestIdForSide(String side) {
+            return "away".equals(side) ? awayRequestId : homeRequestId;
+        }
+
+        private void markReady(String requestId, long now) {
+            String key = safeTextStatic(requestId);
+            if (!key.isBlank()) readyRequestIds.add(key);
+            if (!started && readyRequestIds.contains(homeRequestId) && readyRequestIds.contains(awayRequestId)) {
+                started = true;
+                lastAdvancedAtMillis = now;
+                pauseReason = "";
+                notifyAll();
+            }
+        }
+
         private FieldSize fieldSizeForRequestId(String requestId) {
             return fieldSizesByRequestId.getOrDefault(safeTextStatic(requestId), canonicalFieldSize());
         }
 
-        private void advanceExpiredTurn(long now) {
-            if (!finished && now - startedAtMillis >= MATCH_DURATION_MILLIS) {
-                ScoreDto score = serverState.score();
-                if (score.home() > score.away()) {
-                    finishWithWinner("home", "比赛结束");
-                    return;
-                }
-                if (score.away() > score.home()) {
-                    finishWithWinner("away", "比赛结束");
-                    return;
-                }
+        private void advanceRuntime(long now) {
+            if (finished) {
+                lastAdvancedAtMillis = now;
+                return;
             }
-            if (awaitingConfirmation()) return;
-            while (now - turnStartedAtMillis >= TURN_DURATION_MILLIS) {
-                turnNetworkSide = opponentSide(turnNetworkSide);
-                serverState.turn = turnNetworkSide;
-                turnStartedAtMillis += TURN_DURATION_MILLIS;
+            if (!started) {
+                lastAdvancedAtMillis = now;
+                return;
             }
+            if (now <= lastAdvancedAtMillis) return;
+            long remaining = now - lastAdvancedAtMillis;
+            long cursor = lastAdvancedAtMillis;
+            while (remaining > 0 && !finished) {
+                long slice = Math.min(SERVER_RUNTIME_TICK_MILLIS, remaining);
+                long next = cursor + slice;
+                if (celebrationUntilMillis > cursor) {
+                    long pausedSlice = Math.min(slice, celebrationUntilMillis - cursor);
+                    cursor += pausedSlice;
+                    remaining -= pausedSlice;
+                    pauseReason = "goal";
+                    if (cursor >= celebrationUntilMillis) {
+                        finishGoalCelebration(cursor);
+                    }
+                    continue;
+                }
+                pauseReason = "";
+                boolean settledBeforeSlice = serverState.isSettled();
+                boolean goalStarted = false;
+                if (settledBeforeSlice) {
+                    physicsStepAccumulatorSeconds = 0;
+                } else {
+                    physicsStepAccumulatorSeconds += slice / 1000.0;
+                    while (physicsStepAccumulatorSeconds + 1e-9 >= SERVER_PHYSICS_STEP_SECONDS) {
+                        boolean settledBeforeStep = serverState.isSettled();
+                        serverState.step(SERVER_PHYSICS_STEP_SECONDS);
+                        serverState.tick += 1;
+                        physicsStepAccumulatorSeconds = Math.max(0, physicsStepAccumulatorSeconds - SERVER_PHYSICS_STEP_SECONDS);
+                        ScoreDto score = serverState.score();
+                        if (score.home() >= WIN_SCORE) {
+                            startGoalCelebration(cursor, "home");
+                            pendingWinnerAfterCelebration = "home";
+                            goalStarted = true;
+                            break;
+                        }
+                        if (score.away() >= WIN_SCORE) {
+                            startGoalCelebration(cursor, "away");
+                            pendingWinnerAfterCelebration = "away";
+                            goalStarted = true;
+                            break;
+                        }
+                        ScoreDto lastRecordedScore = lastRecordedScore();
+                        if (score.home() > lastRecordedScore.home() || score.away() > lastRecordedScore.away()) {
+                            String side = score.home() > lastRecordedScore.home() ? "home" : "away";
+                            startGoalCelebration(cursor, side);
+                            goalStarted = true;
+                            break;
+                        }
+                        if (!settledBeforeStep && serverState.isSettled()) {
+                            physicsStepAccumulatorSeconds = 0;
+                            notifyAll();
+                            break;
+                        }
+                    }
+                }
+                if (goalStarted) break;
+                matchElapsedMillis += slice;
+                if (settledBeforeSlice && serverState.isSettled()) {
+                    turnElapsedMillis = Math.min(TURN_DURATION_MILLIS, turnElapsedMillis + slice);
+                }
+                if (matchElapsedMillis >= MATCH_DURATION_MILLIS) {
+                    finishByTime();
+                    break;
+                }
+                cursor = next;
+                remaining -= slice;
+            }
+            lastAdvancedAtMillis = now;
         }
 
-        private OnlineClockDto clock(long now, String targetNetworkSide) {
-            double matchRemaining = Math.max(0, (MATCH_DURATION_MILLIS - (now - startedAtMillis)) / 1000.0);
-            double turnRemaining = awaitingConfirmation() ? TURN_DURATION_MILLIS / 1000.0 : Math.max(0, (TURN_DURATION_MILLIS - (now - turnStartedAtMillis)) / 1000.0);
-            return new OnlineClockDto(now, matchRemaining, turnRemaining, localSide(turnNetworkSide, targetNetworkSide), !awaitingConfirmation());
+        private OnlineClockDto clock(long now) {
+            boolean paused = celebrationUntilMillis > now;
+            double matchRemaining = Math.max(0, (MATCH_DURATION_MILLIS - matchElapsedMillis) / 1000.0);
+            double turnRemaining = Math.max(0, (TURN_DURATION_MILLIS - turnElapsedMillis) / 1000.0);
+            String reason = !started ? "waiting" : paused ? "goal" : pauseReason;
+            return new OnlineClockDto(now, matchRemaining, turnRemaining, paused || !started, reason);
         }
 
         private int matchSecond(long now) {
-            return (int) Math.max(0, Math.min(MATCH_DURATION_MILLIS, now - startedAtMillis) / 1000);
+            return (int) Math.max(0, Math.min(MATCH_DURATION_MILLIS, matchElapsedMillis) / 1000);
+        }
+
+        private ScoreDto lastRecordedScore() {
+            return new ScoreDto(recordedScoreHome, recordedScoreAway);
+        }
+
+        private boolean controlEnabled() {
+            return started && !finished && celebrationUntilMillis <= System.currentTimeMillis() && serverState.isSettled();
+        }
+
+        private void startGoalCelebration(long now, String goalSide) {
+            if (celebrationUntilMillis > now) return;
+            OnlineMatchService.this.recordOnlineGoal(this, latestAction, goalSide);
+            ScoreDto score = serverState.score();
+            recordedScoreHome = score.home();
+            recordedScoreAway = score.away();
+            turnNetworkSide = opponentSide(goalSide);
+            serverState.turn = turnNetworkSide;
+            turnElapsedMillis = 0;
+            celebrationUntilMillis = now + GOAL_CELEBRATION_MILLIS;
+            pauseReason = "goal";
+            notifyAll();
+        }
+
+        private void finishGoalCelebration(long now) {
+            if (pendingWinnerAfterCelebration != null && !pendingWinnerAfterCelebration.isBlank()) {
+                finishWithWinner(pendingWinnerAfterCelebration, "比赛结束");
+                pendingWinnerAfterCelebration = null;
+            } else if (!finished) {
+                serverState.resetObjects(turnNetworkSide);
+                physicsStepAccumulatorSeconds = 0;
+                turnElapsedMillis = 0;
+            }
+            pauseReason = "";
+            celebrationUntilMillis = 0;
+            lastAdvancedAtMillis = now;
+            notifyAll();
+        }
+
+        private void finishByTime() {
+            ScoreDto score = serverState.score();
+            if (score.home() > score.away()) {
+                finishWithWinner("home", "比赛结束");
+            } else if (score.away() > score.home()) {
+                finishWithWinner("away", "比赛结束");
+            }
         }
 
         private SnapshotDto localSnapshot(String targetNetworkSide) {
             SnapshotDto canonical = serverState.snapshot();
             return "away".equals(targetNetworkSide) ? OnlineMatchService.mirrorSnapshot(canonical) : canonical;
+        }
+
+        private String localTurnSide(String targetNetworkSide) {
+            return localSide(turnNetworkSide, targetNetworkSide);
         }
 
         private String localWinnerSide(String targetNetworkSide) {
@@ -1932,6 +2134,10 @@ public class OnlineMatchService {
 
         private ScoreDto localFinishScore(String targetNetworkSide) {
             return OnlineMatchService.localScore(OnlineMatchService.finishScoreOrNull(this), targetNetworkSide);
+        }
+
+        private ScoreDto localCurrentScore(String targetNetworkSide) {
+            return OnlineMatchService.localScore(serverState.score(), targetNetworkSide);
         }
 
         private int nextActionIndex() {
@@ -1984,30 +2190,6 @@ public class OnlineMatchService {
             return playerId == null ? "" : playerId;
         }
 
-        private boolean awaitingConfirmation() {
-            return pendingByCommandId.values().stream().anyMatch(action -> !action.confirmed);
-        }
-
-        private boolean actionFullyConfirmed(OnlineActionState action) {
-            return action.confirmedRequestIds.contains(homeRequestId) && action.confirmedRequestIds.contains(awayRequestId);
-        }
-
-        private void expireResultTimeouts(long now) {
-            if (finished) return;
-            for (OnlineActionState action : pendingByCommandId.values()) {
-                if (!action.confirmedRequestIds.contains(action.actorRequestId) && now - action.createdAtMillis > RESULT_CONFIRM_TIMEOUT_MILLIS) {
-                    finishWithLoser(action.actorNetworkSide, "操作结算超时");
-                    return;
-                }
-                String receiverSide = opponentSide(action.actorNetworkSide);
-                String receiverRequestId = "home".equals(receiverSide) ? homeRequestId : awayRequestId;
-                if (!action.confirmedRequestIds.contains(receiverRequestId) && now - action.createdAtMillis > RESULT_CONFIRM_TIMEOUT_MILLIS) {
-                    finishWithLoser(receiverSide, "同步对方操作超时");
-                    return;
-                }
-            }
-        }
-
         private void finishWithLoser(String loserSide, String message) {
             if (finished) return;
             loserNetworkSide = "away".equals(loserSide) ? "away" : "home";
@@ -2024,14 +2206,6 @@ public class OnlineMatchService {
             finished = true;
         }
 
-        private ActionResponse finishedActionResponse(long now, String targetNetworkSide) {
-            return new ActionResponse(false, finishMessage, List.of(), lastPublishedSeq, clock(now, targetNetworkSide), localWinnerSide(targetNetworkSide), localLoserSide(targetNetworkSide), localFinishScore(targetNetworkSide));
-        }
-
-        private ResultResponse finishedResultResponse(long now, String targetNetworkSide) {
-            return new ResultResponse(false, false, false, finishMessage, clock(now, targetNetworkSide), localWinnerSide(targetNetworkSide), localLoserSide(targetNetworkSide), localFinishScore(targetNetworkSide), List.of(), List.of());
-        }
-
     }
 
     private static final class OnlineActionState {
@@ -2040,30 +2214,14 @@ public class OnlineMatchService {
         private final String actorRequestId;
         private final String actorNetworkSide;
         private final OnlineShootCommandDto command;
-        private final ScoreDto scoreBefore;
         private final long createdAtMillis;
-        private boolean published;
-        private long publishedAtMillis;
-        private final SnapshotDto expectedSnapshot;
-        private boolean confirmed;
-        private final Set<String> confirmedRequestIds = new HashSet<>();
 
-        private OnlineActionState(Long actorUserId, String actorRequestId, String actorNetworkSide, OnlineShootCommandDto command, ScoreDto scoreBefore, SnapshotDto expectedSnapshot, long createdAtMillis) {
+        private OnlineActionState(Long actorUserId, String actorRequestId, String actorNetworkSide, OnlineShootCommandDto command, long createdAtMillis) {
             this.actorUserId = actorUserId;
             this.actorRequestId = actorRequestId;
             this.actorNetworkSide = actorNetworkSide;
             this.command = command;
-            this.scoreBefore = scoreBefore;
-            this.expectedSnapshot = expectedSnapshot;
             this.createdAtMillis = createdAtMillis;
-        }
-
-        private String expectedGoalSide() {
-            ScoreDto after = expectedSnapshot == null ? null : expectedSnapshot.score();
-            if (scoreBefore == null || after == null) return "";
-            if (after.home() > scoreBefore.home()) return "home";
-            if (after.away() > scoreBefore.away()) return "away";
-            return "";
         }
     }
 

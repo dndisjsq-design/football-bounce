@@ -1,7 +1,6 @@
 import { sys } from 'cc';
 import { setCurrentCoins } from './WalletService';
-
-const DEV_BACKEND_HOST = '192.168.3.45';
+import { resolveApiBaseUrl } from './BackendConfig';
 
 export const AUTH_API_BASE_URL = resolveApiBaseUrl();
 
@@ -39,15 +38,9 @@ const GUEST_DEFAULT_COINS = 100000;
 const GUEST_SESSION_ID_KEY = 'footballBounce.guestSessionId';
 const CLIENT_INSTANCE_ID = `instance-${Date.now().toString(36)}-${randomHex(12)}`;
 const userSummaryListeners: Array<(summary: UserSummary) => void> = [];
-
-function resolveApiBaseUrl(): string {
-  const browserLocation = (globalThis as { location?: { protocol?: string; hostname?: string } }).location;
-  if (browserLocation?.hostname && browserLocation.hostname !== 'localhost' && browserLocation.hostname !== '127.0.0.1') {
-    return `${browserLocation.protocol || 'http:'}//${browserLocation.hostname}:8080/api`;
-  }
-  if (sys.isNative) return `http://${DEV_BACKEND_HOST}:8080/api`;
-  return 'http://127.0.0.1:8080/api';
-}
+let currentUserSummaryCache: UserSummary | null = null;
+let currentAuthToken = sys.localStorage.getItem(AUTH_TOKEN_KEY) || '';
+let currentGuestSessionId = sys.localStorage.getItem(GUEST_SESSION_ID_KEY) || '';
 
 export function authMessage(response: AuthResponse): string {
   if (response.message) return response.message;
@@ -72,6 +65,7 @@ export function registerAccount(username: string, password: string): Promise<Aut
 }
 
 export function loginAsGuest(): void {
+  currentAuthToken = '';
   sys.localStorage.removeItem(AUTH_TOKEN_KEY);
   sys.localStorage.removeItem(AUTH_EXPIRES_AT_KEY);
   applyUserSummary({
@@ -87,7 +81,8 @@ export function loginAsGuest(): void {
 }
 
 export function tryAutoLogin(): Promise<AuthResponse | null> {
-  const authToken = sys.localStorage.getItem(AUTH_TOKEN_KEY) || '';
+  if (isDesktopNativeRuntime()) return Promise.resolve(null);
+  const authToken = currentAuthToken;
   if (!authToken) return Promise.resolve(null);
   return postAuth('/auth/auto-login', { deviceId: getOrCreateDeviceId(), authToken, clientInstanceId: CLIENT_INSTANCE_ID }).then((response) => {
     if (response.code === 'SUCCESS') {
@@ -116,7 +111,8 @@ export function startGuestLogin(): void {
   const previousGuestSessionId = getCurrentGuestSessionId();
   resetGuestAccount(previousGuestSessionId);
   loginAsGuest();
-  sys.localStorage.setItem(GUEST_SESSION_ID_KEY, `guest-${Date.now().toString(36)}-${randomHex(12)}`);
+  currentGuestSessionId = `guest-${Date.now().toString(36)}-${randomHex(12)}`;
+  sys.localStorage.setItem(GUEST_SESSION_ID_KEY, currentGuestSessionId);
 }
 
 export function getCurrentUserDisplayName(): string {
@@ -130,13 +126,19 @@ export function getCurrentUserId(): number {
 }
 
 export function getCurrentUserSummary(): UserSummary {
+  if (currentUserSummaryCache) return currentUserSummaryCache;
   const saved = sys.localStorage.getItem(AUTH_USER_KEY);
-  if (!saved) return guestSummary();
+  if (!saved) {
+    currentUserSummaryCache = guestSummary();
+    return currentUserSummaryCache;
+  }
   try {
     const user = JSON.parse(saved) as Partial<UserSummary>;
-    return normalizeUserSummary(user);
+    currentUserSummaryCache = normalizeUserSummary(user);
+    return currentUserSummaryCache;
   } catch {
-    return guestSummary();
+    currentUserSummaryCache = guestSummary();
+    return currentUserSummaryCache;
   }
 }
 
@@ -152,6 +154,7 @@ export function applyUserSummary(summary: Partial<UserSummary> | null | undefine
   if (!summary) return;
   const previous = getCurrentUserSummary();
   const next = normalizeUserSummary({ ...previous, ...summary });
+  currentUserSummaryCache = next;
   sys.localStorage.setItem(AUTH_USER_KEY, JSON.stringify(next));
   if (typeof next.coins === 'number') setCurrentCoins(next.coins);
   for (const listener of userSummaryListeners.slice()) listener(next);
@@ -164,7 +167,7 @@ export function applyApiUserSummary(response: unknown): void {
 }
 
 export function getCurrentGuestSessionId(): string {
-  return sys.localStorage.getItem(GUEST_SESSION_ID_KEY) || '';
+  return currentGuestSessionId;
 }
 
 export function getCurrentDeviceId(): string {
@@ -172,7 +175,7 @@ export function getCurrentDeviceId(): string {
 }
 
 export function getCurrentAuthToken(): string {
-  return sys.localStorage.getItem(AUTH_TOKEN_KEY) || '';
+  return currentAuthToken;
 }
 
 export function getCurrentClientInstanceId(): string {
@@ -184,6 +187,9 @@ export function isCurrentUserGuest(): boolean {
 }
 
 export function clearAuthSession(): void {
+  currentUserSummaryCache = null;
+  currentAuthToken = '';
+  currentGuestSessionId = '';
   sys.localStorage.removeItem(AUTH_TOKEN_KEY);
   sys.localStorage.removeItem(AUTH_USER_KEY);
   sys.localStorage.removeItem(AUTH_EXPIRES_AT_KEY);
@@ -192,9 +198,12 @@ export function clearAuthSession(): void {
 
 function saveAuthSession(response: AuthResponse): void {
   if (response.code !== 'SUCCESS') return;
+  currentGuestSessionId = '';
   sys.localStorage.removeItem(GUEST_SESSION_ID_KEY);
   applyUserSummary(response.user || response.userSummary);
+  currentAuthToken = response.authToken || '';
   if (response.authToken) sys.localStorage.setItem(AUTH_TOKEN_KEY, response.authToken);
+  else sys.localStorage.removeItem(AUTH_TOKEN_KEY);
   if (response.expiresAt) sys.localStorage.setItem(AUTH_EXPIRES_AT_KEY, response.expiresAt);
 }
 
@@ -248,6 +257,13 @@ function randomHex(byteLength: number): string {
     const hex = value.toString(16);
     return hex.length === 1 ? `0${hex}` : hex;
   }).join('');
+}
+
+function isDesktopNativeRuntime(): boolean {
+  const runtime = sys as unknown as { isNative?: boolean; os?: string };
+  if (!runtime.isNative) return false;
+  const os = String(runtime.os || '').toLowerCase();
+  return os.includes('os x') || os.includes('mac') || os.includes('windows') || os.includes('linux');
 }
 
 export function postAuth(path: string, body: Record<string, string>): Promise<AuthResponse> {

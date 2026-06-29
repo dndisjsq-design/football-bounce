@@ -86,14 +86,7 @@ public interface MatchRecordMapper {
                    actor_side AS actorSide,
                    actor_id AS actorId,
                    action_type AS actionType,
-                   GREATEST(
-                       match_second,
-                       COALESCE((
-                           SELECT TIMESTAMPDIFF(SECOND, MIN(r.match_time), match_action.created_at)
-                           FROM user_match_record r
-                           WHERE r.match_no = match_action.match_no
-                       ), 0)
-                   ) AS matchSecond,
+                   match_second AS matchSecond,
                    command_json AS commandJson,
                    valid_result AS validResult,
                    validation_message AS validationMessage,

@@ -44,6 +44,7 @@ export interface ShootCommand {
   fieldWidth?: number;
   fieldHeight?: number;
   clientTick: number;
+  noop?: boolean;
 }
 
 export interface MatchSnapshot {
